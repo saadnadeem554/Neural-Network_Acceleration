@@ -81,7 +81,3 @@ TO BE DECIDED
 **Github**: [Hassaan-Anwar](https://github.com/Hassaan-Anwar)
 ## Mustafa Iqbal
 **Github**: [Mustafaiqbal2](https://github.com/mustafaiqbal2)
-
-## GitHub Repository
-
-[Link to GitHub Repository](https://github.com/mustafaiqbal2/Neural-Network_Acceleration)
