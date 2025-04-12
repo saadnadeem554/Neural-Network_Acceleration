@@ -15,9 +15,10 @@ Neural-Network_Acceleration/
 │   ├── V2/        # TO BE IMPLEMENTED
 │   ├── V3/        # TO BE IMPLEMENTED
 │   ├── V4/        # TO BE IMPLEMENTED
-│   └── data/      # MNIST dataset files
+│   
 ├── report/        # Project report
 ├── slides/        # Presentation slides
+└── data/      # MNIST dataset files
 └── README.md      # This file
 ```
 

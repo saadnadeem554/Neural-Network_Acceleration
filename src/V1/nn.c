@@ -154,7 +154,6 @@ void train(NeuralNetwork* net, double** images, double** labels, int numImages) 
         printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
                epoch + 1, loss / numImages, (correct / (double)numImages) * 100, get_time(epoch_start));
     }
-    printf("Total training time: %.3fs\n", get_time(total_start));
 }
 
 // Evaluate accuracy on test data
@@ -241,14 +240,34 @@ void freeNetwork(NeuralNetwork* net) {
 int main() {
     printf("MNIST Neural Network\n\n");
 
-    double** train_images = loadMNISTImages("./data/train-images.idx3-ubyte", 60000);
-    double** train_labels = loadMNISTLabels("./data/train-labels.idx1-ubyte", 60000);
-    double** test_images = loadMNISTImages("./data/t10k-images.idx3-ubyte", 10000);
-    double** test_labels = loadMNISTLabels("./data/t10k-labels.idx1-ubyte", 10000);
+    // Start measuring total execution time
+    clock_t total_start = clock();
 
+    // Measure time for loading data
+    clock_t start = clock();
+    double** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
+    double** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
+    double** test_images = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
+    double** test_labels = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
+    clock_t end = clock();
+    printf("Time to load data: %.3fs\n", (double)(end - start) / CLOCKS_PER_SEC);
+
+    // Measure time for training
+    start = clock();
     NeuralNetwork* net = createNetwork();
     train(net, train_images, train_labels, 60000);
+    end = clock();
+    printf("Time to train: %.3fs\n", (double)(end - start) / CLOCKS_PER_SEC);
+
+    // Measure time for evaluation
+    start = clock();
     evaluate(net, test_images, test_labels, 10000);
+    end = clock();
+    printf("Time to evaluate: %.3fs\n", (double)(end - start) / CLOCKS_PER_SEC);
+
+    // End measuring total execution time
+    clock_t total_end = clock();
+    printf("Total execution time: %.3fs\n", (double)(total_end - total_start) / CLOCKS_PER_SEC);
 
     freeNetwork(net);
     return 0;
