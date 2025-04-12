@@ -72,7 +72,55 @@ make v4
   ```
 
 ## Implementation Details
-TO BE DECIDED
+# MNIST Neural Network - V2 (Naive GPU Implementation)
+
+## Overview
+This is a naive GPU implementation of a neural network for MNIST digit classification using CUDA. This version represents the first step in transitioning from CPU to GPU computation, serving as a baseline for further optimizations.
+
+
+### Architecture
+- Input Layer: 784 neurons (28x28 pixels)
+- Hidden Layer: 128 neurons with ReLU activation
+- Output Layer: 10 neurons with Softmax activation
+- Learning Rate: 0.01
+- Epochs: 3
+- Batch Size: 64
+
+### Key Components
+1. **Neural Network Structure**
+   - Device (GPU) weights and biases
+   - Host (CPU) copies of weights and biases
+   - Basic CUDA kernels for matrix operations
+
+2. **CUDA Kernels**
+   - `reluKernel`: ReLU activation function
+   - `softmaxKernel`: Softmax activation function
+   - `matrixMulKernel`: Basic matrix multiplication
+   - `backwardOutputKernel`: Gradient computation
+
+3. **Memory Management**
+   - Basic GPU memory allocation and deallocation
+   - Simple host-to-device and device-to-host transfers
+
+## Performance Metrics
+- Training Time: ~36.47 seconds
+- Test Accuracy: 96.80%
+- Training Accuracy: 97.92% (after 3 epochs)
+- Data Loading Time: ~1.67 seconds
+- Total Execution Time: ~38.73 seconds
+
+### Epoch-wise Performance
+- Epoch 1: 91.93% accuracy (12.239s)
+- Epoch 2: 96.99% accuracy (12.020s)
+- Epoch 3: 97.92% accuracy (12.004s)
+
+## Known Limitations
+- Basic memory transfer pattern without optimization
+- No use of shared memory
+- Limited parallelization in backward pass
+- Single-stream execution
+- No batching optimization
+- Simple kernel configurations
 
 # Team Members
 
