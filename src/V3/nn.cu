@@ -1,4 +1,3 @@
-%%writefile my_cuda_program.cu
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -43,17 +42,26 @@ __global__ void reluKernel(float* x, int size) {
 
 // CUDA kernel for Softmax activation
 __global__ void softmaxKernel(float* x, int size) {
+    // Fixed size shared memory allocations
+    __shared__ float shared_x[OUTPUT_SIZE];  // Assuming size <= OUTPUT_SIZE
+    __shared__ float temp_max[BLOCK_SIZE];
+    __shared__ float temp_sum[BLOCK_SIZE];
     __shared__ float shared_max;
     __shared__ float shared_sum;
 
-    // Find maximum value
+    // Load input data into shared memory
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        shared_x[i] = x[i];
+    }
+    __syncthreads();
+
+    // Find maximum value using shared memory
     float local_max = -INFINITY;
     for (int i = threadIdx.x; i < size; i += blockDim.x) {
-        local_max = fmaxf(local_max, x[i]);
+        local_max = fmaxf(local_max, shared_x[i]);
     }
 
     // Reduce to find maximum
-    __shared__ float temp_max[BLOCK_SIZE];
     temp_max[threadIdx.x] = local_max;
     __syncthreads();
 
@@ -69,15 +77,14 @@ __global__ void softmaxKernel(float* x, int size) {
     }
     __syncthreads();
 
-    // Compute exp and sum
+    // Compute exp and sum using shared memory
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < size; i += blockDim.x) {
-        x[i] = expf(x[i] - shared_max);
-        local_sum += x[i];
+        shared_x[i] = expf(shared_x[i] - shared_max);
+        local_sum += shared_x[i];
     }
 
     // Reduce to find sum
-    __shared__ float temp_sum[BLOCK_SIZE];
     temp_sum[threadIdx.x] = local_sum;
     __syncthreads();
 
@@ -93,62 +100,61 @@ __global__ void softmaxKernel(float* x, int size) {
     }
     __syncthreads();
 
-    // Normalize
+    // Normalize using shared memory and write back to global memory
     for (int i = threadIdx.x; i < size; i += blockDim.x) {
-        x[i] /= shared_sum;
+        x[i] = shared_x[i] / shared_sum;
     }
 }
 
 // CUDA kernel for matrix multiplication (for forward pass)
-__global__ void optimizedMatrixMulKernel(float* A, float* B, float* C, float* bias,
-    int M, int N, int K) {
-// Block size (TILE_SIZE x TILE_SIZE)
-const int TILE_SIZE = 16;
+__global__ void optimizedMatrixMulKernel(float* A, float* B, float* C, float* bias,int M, int N, int K) {
+    // Block size (TILE_SIZE x TILE_SIZE)
+    const int TILE_SIZE = 16;
 
-// Shared memory for tiles of A and B
-__shared__ float As[TILE_SIZE][TILE_SIZE];
-__shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    // Shared memory for tiles of A and B
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
-// Thread indices
-int row = blockIdx.y * blockDim.y + threadIdx.y;
-int col = blockIdx.x * blockDim.x + threadIdx.x;
+    // Thread indices
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-float sum = 0.0f;
+    float sum = 0.0f;
 
-// Loop over tiles
-for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; ++t) {
-// Load tile of A into shared memory
-int A_col = t * TILE_SIZE + threadIdx.x;
-if (row < M && A_col < N) {
-As[threadIdx.y][threadIdx.x] = A[row * N + A_col];
-} else {
-As[threadIdx.y][threadIdx.x] = 0.0f;
-}
+    // Loop over tiles
+    for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        // Load tile of A into shared memory
+        int A_col = t * TILE_SIZE + threadIdx.x;
+        if (row < M && A_col < N) {
+            As[threadIdx.y][threadIdx.x] = A[row * N + A_col];
+        } else {
+            As[threadIdx.y][threadIdx.x] = 0.0f;
+        }
 
-// Load tile of B into shared memory
-int B_row = t * TILE_SIZE + threadIdx.y;
-if (B_row < N && col < K) {
-Bs[threadIdx.y][threadIdx.x] = B[B_row * K + col];
-} else {
-Bs[threadIdx.y][threadIdx.x] = 0.0f;
-}
+        // Load tile of B into shared memory
+        int B_row = t * TILE_SIZE + threadIdx.y;
+        if (B_row < N && col < K) {
+            Bs[threadIdx.y][threadIdx.x] = B[B_row * K + col];
+        } else {
+            Bs[threadIdx.y][threadIdx.x] = 0.0f;
+        }
 
-// Synchronize to ensure all threads have loaded their data
-__syncthreads();
+        // Synchronize to ensure all threads have loaded their data
+        __syncthreads();
 
-// Compute partial product for this tile
-for (int k = 0; k < TILE_SIZE; ++k) {
-sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-}
+        // Compute partial product for this tile
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        }
 
-// Synchronize before loading next tile
-__syncthreads();
-}
+        // Synchronize before loading next tile
+        __syncthreads();
+    }
 
-// Write result to C with bias
-if (row < M && col < K) {
-C[row * K + col] = sum + bias[row];
-}
+    // Write result to C with bias
+    if (row < M && col < K) {
+        C[row * K + col] = sum + bias[row];
+    }
 }
 
 // CUDA kernel for backward pass output layer
@@ -261,35 +267,33 @@ NeuralNetwork* createNetwork() {
 }
 // Add these kernel functions for gradient computation
 __global__ void computeGradients(float* d_output, float* d_target, float* d_hidden,
-    float* d_input, float* d_W2_grad, float* d_b2_grad,
-    float* d_W1_grad, float* d_b1_grad,
-    float* d_W2, float* d_W1,
-    int M, int N, int K) {
-int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float* d_input, float* d_W2_grad, float* d_b2_grad,float* d_W1_grad, float* d_b1_grad,float* d_W2, float* d_W1,int M, int N, int K) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-if (idx < OUTPUT_SIZE) {
-// Output layer gradients
-float output_error = d_output[idx] - d_target[idx];
-d_b2_grad[idx] = output_error;
+    if (idx < OUTPUT_SIZE) {
+        // Output layer gradients
+        float output_error = d_output[idx] - d_target[idx];
+        d_b2_grad[idx] = output_error;
 
-for (int j = 0; j < HIDDEN_SIZE; j++) {
-atomicAdd(&d_W2_grad[idx * HIDDEN_SIZE + j], output_error * d_hidden[j]);
-}
-}
+        for (int j = 0; j < HIDDEN_SIZE; j++) {
+            atomicAdd(&d_W2_grad[idx * HIDDEN_SIZE + j], output_error * d_hidden[j]);
+        }
+    }
 
-if (idx < HIDDEN_SIZE) {
-// Hidden layer gradients
-float hidden_error = 0.0f;
-for (int j = 0; j < OUTPUT_SIZE; j++) {
-hidden_error += (d_output[j] - d_target[j]) * d_W2[j * HIDDEN_SIZE + idx];
-}
-hidden_error *= (d_hidden[idx] > 0.0f); // ReLU derivative
+    if (idx < HIDDEN_SIZE) {
+        // Hidden layer gradients
+        float hidden_error = 0.0f;
+        for (int j = 0; j < OUTPUT_SIZE; j++) {
+            hidden_error += (d_output[j] - d_target[j]) * d_W2[j * HIDDEN_SIZE + idx];
+        }
+        hidden_error *= (d_hidden[idx] > 0.0f); // ReLU derivative
 
-d_b1_grad[idx] = hidden_error;
-for (int j = 0; j < INPUT_SIZE; j++) {
-atomicAdd(&d_W1_grad[idx * INPUT_SIZE + j], hidden_error * d_input[j]);
-}
-}
+        d_b1_grad[idx] = hidden_error;
+        for (int j = 0; j < INPUT_SIZE; j++) {
+            atomicAdd(&d_W1_grad[idx * INPUT_SIZE + j], hidden_error * d_input[j]);
+        }
+    }
 }
 
 __global__ void updateParameters(float* d_W, float* d_b, float* d_W_grad, float* d_b_grad, int rows, int cols, float learning_rate) {
@@ -306,40 +310,42 @@ __global__ void updateParameters(float* d_W, float* d_b, float* d_W_grad, float*
 
 // Update the backward function
 void backward(NeuralNetwork* net, float* d_input, float* d_hidden, 
-float* d_output, float* d_target) {
-    // Allocate gradient matrices
+    float* d_output, float* d_target) {
+        // Allocate gradient matrices
     float *d_W1_grad, *d_W2_grad, *d_b1_grad, *d_b2_grad;
     CHECK_CUDA_ERROR(cudaMalloc(&d_W1_grad, HIDDEN_SIZE * INPUT_SIZE * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_W2_grad, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_b1_grad, HIDDEN_SIZE * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_b2_grad, OUTPUT_SIZE * sizeof(float)));
-
+    
     // Initialize gradients to zero
     cudaMemset(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float));
     cudaMemset(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float));
     cudaMemset(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float));
     cudaMemset(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float));
-
+    
     // Compute gradients
     int blockSize = 256;
     int numBlocks = (max(OUTPUT_SIZE, HIDDEN_SIZE) + blockSize - 1) / blockSize;
-
+    
     computeGradients<<<numBlocks, blockSize>>>(
-    d_output, d_target, d_hidden, d_input, d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,net->d_W2, net->d_W1,HIDDEN_SIZE, INPUT_SIZE, OUTPUT_SIZE);
+        d_output, d_target, d_hidden, d_input, 
+        d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
+        net->d_W2, net->d_W1, HIDDEN_SIZE, INPUT_SIZE, OUTPUT_SIZE);
 
-    // Update parameters
     updateParameters<<<(HIDDEN_SIZE * INPUT_SIZE + blockSize - 1) / blockSize, blockSize>>>(
-    net->d_W1, net->d_b1, d_W1_grad, d_b1_grad,HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE);
-
+            net->d_W1, net->d_b1, d_W1_grad, d_b1_grad, HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE);
+    
     updateParameters<<<(OUTPUT_SIZE * HIDDEN_SIZE + blockSize - 1) / blockSize, blockSize>>>(
-    net->d_W2, net->d_b2, d_W2_grad, d_b2_grad,OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE);
-
+            net->d_W2, net->d_b2, d_W2_grad, d_b2_grad, OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE);
+    
+    
     // Free gradient memory
     cudaFree(d_W1_grad);
     cudaFree(d_W2_grad);
     cudaFree(d_b1_grad);
     cudaFree(d_b2_grad);
-}
+    }
 // Forward pass
 void forward(NeuralNetwork* net, float* d_input, float* d_hidden, float* d_output) {
     // Configure block and grid dimensions
@@ -363,62 +369,62 @@ void forward(NeuralNetwork* net, float* d_input, float* d_hidden, float* d_outpu
 // Update the train function to include loss calculation
 void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages) {
 float *d_input, *d_hidden, *d_output, *d_target;
-CHECK_CUDA_ERROR(cudaMalloc(&d_input, INPUT_SIZE * sizeof(float)));
-CHECK_CUDA_ERROR(cudaMalloc(&d_hidden, HIDDEN_SIZE * sizeof(float)));
-CHECK_CUDA_ERROR(cudaMalloc(&d_output, OUTPUT_SIZE * sizeof(float)));
-CHECK_CUDA_ERROR(cudaMalloc(&d_target, OUTPUT_SIZE * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_input, INPUT_SIZE * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_hidden, HIDDEN_SIZE * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_output, OUTPUT_SIZE * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_target, OUTPUT_SIZE * sizeof(float)));
 
-for (int epoch = 0; epoch < EPOCHS; epoch++) {
-float loss = 0.0f;
-int correct = 0;
-clock_t epoch_start = clock();
+    for (int epoch = 0; epoch < EPOCHS; epoch++) {
+        float loss = 0.0f;
+        int correct = 0;
+        clock_t epoch_start = clock();
 
-for (int i = 0; i < numImages; i++) {
-// Copy current training example to device
-CHECK_CUDA_ERROR(cudaMemcpy(d_input, h_images[i],
-INPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-CHECK_CUDA_ERROR(cudaMemcpy(d_target, h_labels[i],
-OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+        for (int i = 0; i < numImages; i++) {
+            // Copy current training example to device
+            CHECK_CUDA_ERROR(cudaMemcpy(d_input, h_images[i],
+            INPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+            CHECK_CUDA_ERROR(cudaMemcpy(d_target, h_labels[i],
+            OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
 
-// Forward and backward passes
-forward(net, d_input, d_hidden, d_output);
-backward(net, d_input, d_hidden, d_output, d_target);
+            // Forward and backward passes
+            forward(net, d_input, d_hidden, d_output);
+            backward(net, d_input, d_hidden, d_output, d_target);
 
-// Compute accuracy and loss
-float h_output[OUTPUT_SIZE];
-float h_target[OUTPUT_SIZE];
-CHECK_CUDA_ERROR(cudaMemcpy(h_output, d_output,
-OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
-CHECK_CUDA_ERROR(cudaMemcpy(h_target, d_target,
-OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+            // Compute accuracy and loss
+            float h_output[OUTPUT_SIZE];
+            float h_target[OUTPUT_SIZE];
+            CHECK_CUDA_ERROR(cudaMemcpy(h_output, d_output,
+            OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA_ERROR(cudaMemcpy(h_target, d_target,
+            OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
 
-// Calculate cross-entropy loss
-for (int j = 0; j < OUTPUT_SIZE; j++) {
-if (h_target[j] > 0.5f) {  // This is the correct class
-loss -= log(fmax(h_output[j], 1e-7f));
-}
-}
+            // Calculate cross-entropy loss
+            for (int j = 0; j < OUTPUT_SIZE; j++) {
+            if (h_target[j] > 0.5f) {  // This is the correct class
+            loss -= log(fmax(h_output[j], 1e-7f));
+            }
+            }
 
-// Calculate accuracy
-int pred = 0, actual = 0;
-for (int j = 0; j < OUTPUT_SIZE; j++) {
-if (h_output[j] > h_output[pred]) pred = j;
-if (h_target[j] > h_target[actual]) actual = j;
-}
-if (pred == actual) correct++;
-}
+            // Calculate accuracy
+            int pred = 0, actual = 0;
+            for (int j = 0; j < OUTPUT_SIZE; j++) {
+            if (h_output[j] > h_output[pred]) pred = j;
+            if (h_target[j] > h_target[actual]) actual = j;
+            }
+            if (pred == actual) correct++;
+        }
 
-// Print epoch statistics
-printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
-epoch + 1, loss / numImages, (correct / (float)numImages) * 100,
-(float)(clock() - epoch_start) / CLOCKS_PER_SEC);
-}
+        // Print epoch statistics
+        printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
+        epoch + 1, loss / numImages, (correct / (float)numImages) * 100,
+        (float)(clock() - epoch_start) / CLOCKS_PER_SEC);
+    }
 
-// Free device memory
-cudaFree(d_input);
-cudaFree(d_hidden);
-cudaFree(d_output);
-cudaFree(d_target);
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_hidden);
+    cudaFree(d_output);
+    cudaFree(d_target);
 }
 
 // Free network memory
