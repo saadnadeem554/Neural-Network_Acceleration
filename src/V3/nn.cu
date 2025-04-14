@@ -1,3 +1,4 @@
+//%%writefile my_cuda_program.cu
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -157,14 +158,8 @@ __global__ void optimizedMatrixMulKernel(float* A, float* B, float* C, float* bi
     }
 }
 
-// CUDA kernel for backward pass output layer
-__global__ void backwardOutputKernel(float* d_output, float* d_target,
-                                   float* d_output_error, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        d_output_error[idx] = d_output[idx] - d_target[idx];
-    }
-}
+
+
 // Allocate memory for a matrix
 float** allocateMatrix(int rows, int cols) {
     float** mat = (float**)malloc(rows * sizeof(float*));
@@ -267,7 +262,7 @@ NeuralNetwork* createNetwork() {
 }
 // Add these kernel functions for gradient computation
 __global__ void computeGradients(float* d_output, float* d_target, float* d_hidden,
-    float* d_input, float* d_W2_grad, float* d_b2_grad,float* d_W1_grad, float* d_b1_grad,float* d_W2, float* d_W1,int M, int N, int K) {
+    float* d_input, float* d_W2_grad, float* d_b2_grad,float* d_W1_grad, float* d_b1_grad,float* d_W2,int M, int N, int K) {
     
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -331,7 +326,7 @@ void backward(NeuralNetwork* net, float* d_input, float* d_hidden,
     computeGradients<<<numBlocks, blockSize>>>(
         d_output, d_target, d_hidden, d_input, 
         d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
-        net->d_W2, net->d_W1, HIDDEN_SIZE, INPUT_SIZE, OUTPUT_SIZE);
+        net->d_W2, HIDDEN_SIZE, INPUT_SIZE, OUTPUT_SIZE);
 
     updateParameters<<<(HIDDEN_SIZE * INPUT_SIZE + blockSize - 1) / blockSize, blockSize>>>(
             net->d_W1, net->d_b1, d_W1_grad, d_b1_grad, HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE);
