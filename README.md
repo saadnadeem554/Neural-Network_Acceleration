@@ -122,6 +122,24 @@ This is a naive GPU implementation of a neural network for MNIST digit classific
 - No batching optimization
 - Simple kernel configurations
 
+## Implementation Details
+# MNIST Neural Network - V3 (Optimised GPU Implementation)
+
+## Overview
+This version builds upon V2 by introducing shared memory and other optimizations
+
+## Performance Metrics
+- Training Time: ~35.82 seconds
+- Test Accuracy: 96.97%
+- Training Accuracy: 97.77% (after 3 epochs)
+- Data Loading Time: ~1.67 seconds
+- Total Execution Time: ~37.83 seconds
+
+### Epoch-wise Performance
+- Epoch 1: 91.91% accuracy (11.970s)
+- Epoch 2: 96.86% accuracy (11.828s)
+- Epoch 3: 97.77% accuracy (11.821s)
+
 # Team Members
 
 ## Saad Nadeem
