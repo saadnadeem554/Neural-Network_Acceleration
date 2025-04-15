@@ -14,7 +14,7 @@
 #define OUTPUT_SIZE 10
 #define LEARNING_RATE 0.01f
 #define EPOCHS 3
-#define BATCH_SIZE 64
+#define BATCH_SIZE 4096
 #define NUM_CLASSES 10
 #define BLOCK_SIZE 256
 

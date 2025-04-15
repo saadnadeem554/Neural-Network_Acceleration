@@ -1,7 +1,7 @@
 CC = gcc
 NVCC = nvcc
 CFLAGS = -Wall -O2
-CUDAFLAGS = -arch=sm_70
+CUDAFLAGS = -O3 -arch=sm_70 --use_fast_math -Xptxas -O3,-v
 
 # Directories
 V1_DIR = V1
