@@ -769,9 +769,6 @@ int main() {
     start = clock();
     evaluate(net, test_images, test_labels, 10000);
 
-    // Measure time for evaluation
-    start = clock();
-    evaluate(net, test_images, test_labels, 10000);
     end = clock();
     printf("Time to evaluate: %.3fs\n", (double)(end - start) / CLOCKS_PER_SEC);
 
