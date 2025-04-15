@@ -29,22 +29,22 @@ $(V1_EXE): $(V1_DIR)/nn.c
 v2: $(V2_EXE)
 	./$(V2_EXE)
 
-$(V2_EXE): $(V2_DIR)/nn_cuda.cu
-	$(NVCC) $(CUDAFLAGS) -o $(V2_EXE) $(V2_DIR)/nn_cuda.cu -lm
+$(V2_EXE): $(V2_DIR)/nn.cu
+	$(NVCC) $(CUDAFLAGS) -o $(V2_EXE) $(V2_DIR)/nn.cu -lm
 
 # Version 3: Optimized GPU Implementation
 v3: $(V3_EXE)
 	./$(V3_EXE)
 
-$(V3_EXE): $(V3_DIR)/nn_optimized.cu
-	$(NVCC) $(CUDAFLAGS) -o $(V3_EXE) $(V3_DIR)/nn_optimized.cu -lm
+$(V3_EXE): $(V3_DIR)/nn.cu
+	$(NVCC) $(CUDAFLAGS) -o $(V3_EXE) $(V3_DIR)/nn.cu -lm
 
 # Version 4: Tensor Core Implementation
 v4: $(V4_EXE)
 	./$(V4_EXE)
 
 $(V4_EXE): $(V4_DIR)/nn_tensor.cu
-	$(NVCC) $(CUDAFLAGS) -o $(V4_EXE) $(V4_DIR)/nn_tensor.cu -lm
+	$(NVCC) $(CUDAFLAGS) -o $(V4_EXE) $(V4_DIR)/nn.cu -lm
 
 # Clean all executables
 clean:

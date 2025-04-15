@@ -245,10 +245,10 @@ int main() {
 
     // Measure time for loading data
     clock_t start = clock();
-    double** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
-    double** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
-    double** test_images = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
-    double** test_labels = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
+    double** train_images = loadMNISTImages("../data/train-images.idx3-ubyte", 60000);
+    double** train_labels = loadMNISTLabels("../data/train-labels.idx1-ubyte", 60000);
+    double** test_images = loadMNISTImages("../data/t10k-images.idx3-ubyte", 10000);
+    double** test_labels = loadMNISTLabels("../data/t10k-labels.idx1-ubyte", 10000);
     clock_t end = clock();
     printf("Time to load data: %.3fs\n", (double)(end - start) / CLOCKS_PER_SEC);
 
