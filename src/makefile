@@ -1,7 +1,7 @@
 CC = gcc
 NVCC = nvcc
 CFLAGS = -Wall -O2
-CUDAFLAGS = -O3 -arch=sm_70 --use_fast_math -Xptxas -O3,-v
+CUDAFLAGS = -O3 -arch=sm_80 --use_fast_math -Xptxas -O3,-v --threads 0 -Xcompiler=-march=native,-Ofast -maxrregcount=64
 
 # Directories
 V1_DIR = V1
@@ -43,8 +43,8 @@ $(V3_EXE): $(V3_DIR)/nn.cu
 v4: $(V4_EXE)
 	./$(V4_EXE)
 
-$(V4_EXE): $(V4_DIR)/nn_tensor.cu
-	$(NVCC) $(CUDAFLAGS) -o $(V4_EXE) $(V4_DIR)/nn.cu -lm
+$(V4_EXE): $(V4_DIR)/nn.cu
+	$(NVCC) $(CUDAFLAGS) -o $(V4_EXE) $(V4_DIR)/nn.cu -lm -lcublas
 
 # Clean all executables
 clean:

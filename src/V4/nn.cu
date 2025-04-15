@@ -8,33 +8,21 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <mma.h>  // For Tensor Core operations
+#include <cublas_v2.h>  // Add cuBLAS header
 
-// Tensor Core tile sizes
-#define TC_M 16
-#define TC_N 16
-#define TC_K 16
+cublasHandle_t cublasHandle;
 
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 128
 #define OUTPUT_SIZE 10
 #define LEARNING_RATE 0.01f
 #define EPOCHS 3
-#define BATCH_SIZE 4096
+#define BATCH_SIZE 64
 #define NUM_CLASSES 10
 #define BLOCK_SIZE 256
 
-// Error checking macro
-#define CHECK_CUDA_ERROR(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error in %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-
+#define CHECK_CUDA_ERROR(call) do { cudaError_t err = call; if (err != cudaSuccess) { fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); exit(1); }} while(0)
+#define CHECK_CUBLAS_ERROR(call) do { cublasStatus_t status = call; if (status != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "cuBLAS Error: %d\n", status); exit(1); }} while(0)
 // Neural network structure for GPU
 typedef struct {
     float *d_W1, *d_W2;    // Device weights
@@ -42,128 +30,6 @@ typedef struct {
     float *h_W1, *h_W2;    // Host weights
     float *h_b1, *h_b2;    // Host biases
 } NeuralNetwork;
-
-// Matrix multiply using Tensor Cores with FP32 (Ampere/SM80+ only)
-__global__ void batchFCReluKernel(float* weights, float* inputs, float* outputs, float* bias,
-                               int output_size, int input_size, int batch_size) {
-    using namespace nvcuda::wmma;
-    
-    // Get indices
-    int row = blockIdx.y * TC_M;
-    int batch = blockIdx.z;
-    
-    if (batch >= batch_size || row >= output_size) return;
-    
-    // Only the first thread in a warp executes the WMMA operations
-    if (threadIdx.x % 32 == 0) {
-        // Declare fragments for FP32 operations (only on Ampere/SM80+)
-        fragment<matrix_a, TC_M, TC_N, TC_K, precision::tf32, row_major> a_frag;
-        fragment<matrix_b, TC_M, TC_N, TC_K, precision::tf32, col_major> b_frag;
-        fragment<accumulator, TC_M, TC_N, TC_K, float> acc_frag;
-        
-        // Zero initialize accumulator
-        fill_fragment(acc_frag, 0.0f);
-        
-        // Process input in TC_K sized chunks
-        for (int k = 0; k < input_size; k += TC_K) {
-            int k_size = min(TC_K, input_size - k);
-            
-            // Convert inputs for TF32 Tensor Core operations
-            float a_tile[TC_M][TC_K] = {0};
-            float b_tile[TC_K][TC_N] = {0};
-            
-            for (int i = 0; i < min(TC_M, output_size - row); i++) {
-                for (int j = 0; j < k_size; j++) {
-                    a_tile[i][j] = weights[(row + i) * input_size + (k + j)];
-                }
-            }
-            
-            for (int i = 0; i < k_size; i++) {
-                for (int j = 0; j < TC_N && j < 1; j++) {
-                    b_tile[i][j] = inputs[batch * input_size + (k + i)];
-                }
-            }
-            
-            load_matrix_sync(a_frag, a_tile[0], TC_K);
-            load_matrix_sync(b_frag, b_tile[0], TC_K);
-            
-            // Perform matrix multiplication
-            mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-        }
-        
-        // Store results back to global memory
-        float result_tile[TC_M][TC_N];
-        store_matrix_sync(result_tile[0], acc_frag, TC_N, mem_row_major);
-        
-        // Apply bias and ReLU activation
-        for (int i = 0; i < min(TC_M, output_size - row); i++) {
-            float b = bias[row + i];
-            outputs[batch * output_size + (row + i)] = fmaxf(0.0f, result_tile[i][0] + b);
-        }
-    }
-}
-
-// Similar implementation for batchFCKernel without ReLU
-__global__ void batchFCKernel(float* weights, float* inputs, float* outputs, float* bias,
-                           int output_size, int input_size, int batch_size) {
-    // Same code as above but without the fmaxf() call at the end
-    using namespace nvcuda::wmma;
-    
-    // Get indices
-    int row = blockIdx.y * TC_M;
-    int batch = blockIdx.z;
-    
-    if (batch >= batch_size || row >= output_size) return;
-    
-    // Only the first thread in a warp executes the WMMA operations
-    if (threadIdx.x % 32 == 0) {
-        // Declare fragments for FP32 operations (only on Ampere/SM80+)
-        fragment<matrix_a, TC_M, TC_N, TC_K, precision::tf32, row_major> a_frag;
-        fragment<matrix_b, TC_M, TC_N, TC_K, precision::tf32, col_major> b_frag;
-        fragment<accumulator, TC_M, TC_N, TC_K, float> acc_frag;
-        
-        // Zero initialize accumulator
-        fill_fragment(acc_frag, 0.0f);
-        
-        // Process input in TC_K sized chunks
-        for (int k = 0; k < input_size; k += TC_K) {
-            int k_size = min(TC_K, input_size - k);
-            
-            // Convert inputs for TF32 Tensor Core operations
-            float a_tile[TC_M][TC_K] = {0};
-            float b_tile[TC_K][TC_N] = {0};
-            
-            for (int i = 0; i < min(TC_M, output_size - row); i++) {
-                for (int j = 0; j < k_size; j++) {
-                    a_tile[i][j] = weights[(row + i) * input_size + (k + j)];
-                }
-            }
-            
-            for (int i = 0; i < k_size; i++) {
-                for (int j = 0; j < TC_N && j < 1; j++) {
-                    b_tile[i][j] = inputs[batch * input_size + (k + i)];
-                }
-            }
-            
-            load_matrix_sync(a_frag, a_tile[0], TC_K);
-            load_matrix_sync(b_frag, b_tile[0], TC_K);
-            
-            // Perform matrix multiplication
-            mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-        }
-        
-        // Store results back to global memory
-        float result_tile[TC_M][TC_N];
-        store_matrix_sync(result_tile[0], acc_frag, TC_N, mem_row_major);
-        
-        // Apply bias only (no ReLU)
-        for (int i = 0; i < min(TC_M, output_size - row); i++) {
-            float b = bias[row + i];
-            outputs[batch * output_size + (row + i)] = result_tile[i][0] + b;
-        }
-    }
-}
-
 
 // Optimized softmax kernel with register caching
 __global__ void batchSoftmaxSmallKernel(float* x, int size, int batchSize) {
@@ -346,114 +212,80 @@ NeuralNetwork* createNetwork() {
         HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA_ERROR(cudaMemcpy(net->d_b2, net->h_b2,
         OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-
+    
+    CHECK_CUBLAS_ERROR(cublasCreate(&cublasHandle));
+        
+    // Enable tensor cores (TF32) for compute capability 8.x
+    CHECK_CUBLAS_ERROR(cublasSetMathMode(cublasHandle, CUBLAS_TF32_TENSOR_OP_MATH));
     return net;
 }
 
-// Optimized gradient computation kernel
-__global__ void batchComputeGradientsOptimized(float* d_batch_output, float* d_batch_target, 
-                                           float* d_batch_hidden, float* d_batch_input,
-                                           float* d_W2_grad, float* d_b2_grad,
-                                           float* d_W1_grad, float* d_b1_grad,
-                                           float* d_W2, float* d_W1,
-                                           int batchSize) {
-    int tid = threadIdx.x;
-    int batch = blockIdx.x;
+
+// ReLU derivative kernel
+__global__ void applyReLUDerivative(float* errors, float* activations, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (batch >= batchSize) return;
-    
-    // Get pointers to this batch's data
-    float* output = d_batch_output + batch * OUTPUT_SIZE;
-    float* target = d_batch_target + batch * OUTPUT_SIZE;
-    float* hidden = d_batch_hidden + batch * HIDDEN_SIZE;
-    float* input = d_batch_input + batch * INPUT_SIZE;
-    
-    // Use shared memory to compute and store output errors
-    __shared__ float output_errors[32];  // Enough for OUTPUT_SIZE=10
-    
-    // Calculate output errors in parallel
-    if (tid < OUTPUT_SIZE) {
-        output_errors[tid] = output[tid] - target[tid];
-        
-        // Update bias gradient
-        atomicAdd(&d_b2_grad[tid], output_errors[tid]);
+    if (idx < size) {
+        errors[idx] *= (activations[idx] > 0.0f) ? 1.0f : 0.0f;
     }
-    __syncthreads();
+}
+
+// Bias gradient computation
+__global__ void computeBiasGrads(float* errors, float* bias_grads, int size, int batchSize) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
     
-    // Each thread updates a subset of W2 gradients
-    for (int i = tid; i < OUTPUT_SIZE * HIDDEN_SIZE; i += blockDim.x) {
-        int out_idx = i / HIDDEN_SIZE;
-        int hid_idx = i % HIDDEN_SIZE;
-        atomicAdd(&d_W2_grad[i], output_errors[out_idx] * hidden[hid_idx]);
-    }
-    
-    // Compute hidden layer errors
-    __shared__ float hidden_errors[128];  // Maximum HIDDEN_SIZE we'd expect
-    
-    // First initialize all to zero
-    for (int i = tid; i < HIDDEN_SIZE; i += blockDim.x) {
-        hidden_errors[i] = 0.0f;
-    }
-    __syncthreads();
-    
-    // Compute hidden errors in parallel across threads
-    for (int i = 0; i < OUTPUT_SIZE; i++) {
-        for (int j = tid; j < HIDDEN_SIZE; j += blockDim.x) {
-            hidden_errors[j] += output_errors[i] * d_W2[i * HIDDEN_SIZE + j];
+    if (idx < size) {
+        float sum = 0.0f;
+        for (int b = 0; b < batchSize; b++) {
+            sum += errors[b * size + idx];
         }
-    }
-    __syncthreads();
-    
-    // Apply ReLU derivative and update bias gradients
-    for (int i = tid; i < HIDDEN_SIZE; i += blockDim.x) {
-        hidden_errors[i] *= (hidden[i] > 0.0f);
-        atomicAdd(&d_b1_grad[i], hidden_errors[i]);
-    }
-    __syncthreads();
-    
-    // Each thread updates a subset of W1 gradients
-    for (int i = tid; i < HIDDEN_SIZE * INPUT_SIZE; i += blockDim.x) {
-        int hid_idx = i / INPUT_SIZE;
-        int in_idx = i % INPUT_SIZE;
-        atomicAdd(&d_W1_grad[i], hidden_errors[hid_idx] * input[in_idx]);
+        bias_grads[idx] = sum / batchSize;
     }
 }
 
-// Optimized parameter update kernel
-__global__ void batchUpdateParametersOptimized(float* d_W, float* d_b, float* d_W_grad, 
-                                           float* d_b_grad, int rows, int cols, 
-                                           float learning_rate, int batchSize) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    
-    // Each thread updates multiple weights using grid-stride loop
-    for (int i = tid; i < rows * cols; i += blockDim.x * gridDim.x) {
-        d_W[i] -= (learning_rate / batchSize) * d_W_grad[i];
-        d_W_grad[i] = 0.0f;  // Reset gradient for next batch
-    }
-    
-    // Update biases with efficient access pattern
-    if (tid < rows) {
-        d_b[tid] -= (learning_rate / batchSize) * d_b_grad[tid];
-        d_b_grad[tid] = 0.0f;  // Reset gradient for next batch
-    }
-}
 
-// Create a persistent update stream for asynchronous parameter updates
-static cudaStream_t updateStream = NULL;
 
-// Optimized backward pass with asynchronous parameter updates
-void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                 float* d_batch_output, float* d_batch_target, int batchSize, cudaStream_t computeStream = 0) {
-    // Allocate gradient matrices
+// Backward pass using tensor cores
+void batchBackwardTensorCore(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
+                            float* d_batch_output, float* d_batch_target, int batchSize, 
+                            cudaStream_t computeStream = 0) {
+    // Compute output error: d_output_error = d_batch_output - d_batch_target
+    float* d_output_error;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_output_error, batchSize * OUTPUT_SIZE * sizeof(float)));
+    
+    // Copy output to error buffer
+    CHECK_CUDA_ERROR(cudaMemcpyAsync(d_output_error, d_batch_output, 
+        batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, computeStream));
+    
+    // Subtract targets from outputs to get error
+    const float alpha = -1.0f;
+    CHECK_CUBLAS_ERROR(cublasSaxpy(cublasHandle, batchSize * OUTPUT_SIZE, 
+                                &alpha, d_batch_target, 1, d_output_error, 1));
+    
+    // Allocate memory for hidden layer error
+    float* d_hidden_error;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_hidden_error, batchSize * HIDDEN_SIZE * sizeof(float)));
+    
+    // Compute hidden layer error: d_hidden_error = W2^T * d_output_error
+    const float alpha1 = 1.0f;
+    const float beta1 = 0.0f;
+    
+    CHECK_CUBLAS_ERROR(cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                HIDDEN_SIZE, batchSize, OUTPUT_SIZE,
+                                &alpha1,
+                                net->d_W2, OUTPUT_SIZE,
+                                d_output_error, OUTPUT_SIZE,
+                                &beta1,
+                                d_hidden_error, HIDDEN_SIZE));
+    
+    // Apply ReLU derivative: d_hidden_error *= (d_batch_hidden > 0)
+    applyReLUDerivative<<<(HIDDEN_SIZE * batchSize + 255) / 256, 256, 0, computeStream>>>(
+        d_hidden_error, d_batch_hidden, HIDDEN_SIZE * batchSize);
+    
+    // Allocate and initialize gradient matrices
     static float *d_W1_grad, *d_W2_grad, *d_b1_grad, *d_b2_grad;
     static bool gradients_initialized = false;
     
-    // Initialize the update stream if this is the first call
-    if (updateStream == NULL) {
-        cudaStreamCreate(&updateStream);
-    }
-    
-    // Initialize gradient buffers if first call
     if (!gradients_initialized) {
         CHECK_CUDA_ERROR(cudaMalloc(&d_W1_grad, HIDDEN_SIZE * INPUT_SIZE * sizeof(float)));
         CHECK_CUDA_ERROR(cudaMalloc(&d_W2_grad, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float)));
@@ -463,94 +295,96 @@ void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidd
         gradients_initialized = true;
     }
     
-    // Clear gradients (in compute stream to ensure they're ready for the next gradient computation)
+    // Clear gradients
     cudaMemsetAsync(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float), computeStream);
     cudaMemsetAsync(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float), computeStream);
     cudaMemsetAsync(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float), computeStream);
     cudaMemsetAsync(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float), computeStream);
     
-    // Compute gradients with optimized kernel - one block per batch item
-    dim3 blockDim(256);
-    dim3 gridDim(batchSize);
+    // Compute W2 gradients: d_W2_grad = d_output_error * d_batch_hidden^T
+    const float alpha2 = 1.0f / batchSize;
+    const float beta2 = 0.0f;
     
-    batchComputeGradientsOptimized<<<gridDim, blockDim, 0, computeStream>>>(
-        d_batch_output, d_batch_target, d_batch_hidden, d_batch_input,
-        d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
-        net->d_W2, net->d_W1, batchSize
-    );
+    CHECK_CUBLAS_ERROR(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+                                OUTPUT_SIZE, HIDDEN_SIZE, batchSize,
+                                &alpha2,
+                                d_output_error, OUTPUT_SIZE,
+                                d_batch_hidden, HIDDEN_SIZE,
+                                &beta2,
+                                d_W2_grad, OUTPUT_SIZE));
     
-    // Create an event to signal when gradient computation is done
-    cudaEvent_t gradientsDone;
-    cudaEventCreate(&gradientsDone);
-    cudaEventRecord(gradientsDone, computeStream);
+    // Compute W1 gradients: d_W1_grad = d_hidden_error * d_batch_input^T
+    CHECK_CUBLAS_ERROR(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+                                HIDDEN_SIZE, INPUT_SIZE, batchSize,
+                                &alpha2,
+                                d_hidden_error, HIDDEN_SIZE,
+                                d_batch_input, INPUT_SIZE,
+                                &beta2,
+                                d_W1_grad, HIDDEN_SIZE));
     
-    // Make the update stream wait for gradients computation to complete
-    cudaStreamWaitEvent(updateStream, gradientsDone, 0);
+    // Compute bias gradients
+    computeBiasGrads<<<OUTPUT_SIZE, 256, 0, computeStream>>>(
+        d_output_error, d_b2_grad, OUTPUT_SIZE, batchSize);
     
-    // Asynchronously update parameters in the update stream
-    batchUpdateParametersOptimized<<<32, 256, 0, updateStream>>>(
-        net->d_W1, net->d_b1, d_W1_grad, d_b1_grad,
-        HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE, batchSize
-    );
+    computeBiasGrads<<<HIDDEN_SIZE, 256, 0, computeStream>>>(
+        d_hidden_error, d_b1_grad, HIDDEN_SIZE, batchSize);
     
-    batchUpdateParametersOptimized<<<32, 256, 0, updateStream>>>(
-        net->d_W2, net->d_b2, d_W2_grad, d_b2_grad,
-        OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE, batchSize
-    );
+    // Update parameters
+    const float lr = -LEARNING_RATE;
     
-    // Clean up the event
-    cudaEventDestroy(gradientsDone);
+    // Update weights
+    CHECK_CUBLAS_ERROR(cublasSaxpy(cublasHandle, HIDDEN_SIZE * INPUT_SIZE,
+                                &lr, d_W1_grad, 1, net->d_W1, 1));
     
-    // Note: We do NOT synchronize the update stream here, allowing it to proceed in the background
+    CHECK_CUBLAS_ERROR(cublasSaxpy(cublasHandle, OUTPUT_SIZE * HIDDEN_SIZE,
+                                &lr, d_W2_grad, 1, net->d_W2, 1));
+    
+    // Update biases
+    CHECK_CUBLAS_ERROR(cublasSaxpy(cublasHandle, HIDDEN_SIZE,
+                                &lr, d_b1_grad, 1, net->d_b1, 1));
+    
+    CHECK_CUBLAS_ERROR(cublasSaxpy(cublasHandle, OUTPUT_SIZE,
+                                &lr, d_b2_grad, 1, net->d_b2, 1));
+    
+    // Free temporary memory
+    cudaFree(d_output_error);
+    cudaFree(d_hidden_error);
 }
 
-// Modified forwardBatch function using Tensor Cores
-void forwardBatch(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                float* d_batch_output, int batchSize, cudaStream_t stream = 0) {
-    // Get device properties to check for Tensor Core support
-    cudaDeviceProp prop;
-    int device;
-    cudaGetDevice(&device);
-    cudaGetDeviceProperties(&prop, device);
+// Combine these two into one function with a flag
+__global__ void addBiasWithOptionalReLU(float* data, float* bias, int rows, int cols, bool applyReLU = false) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
     
-    if (prop.major >= 8) {  // Check for Ampere or newer for FP32 Tensor Cores
-        // Use tensor core kernels for Ampere+ GPUs
-        
-        // Block dimensions optimized for tensor cores (must have at least 32 threads per block)
-        dim3 blockDim(32, 1);  // One warp per block
-        
-        // First layer: FC + ReLU with tensor cores
-        dim3 gridDim1((HIDDEN_SIZE + TC_M - 1) / TC_M, 1, batchSize);
-        batchFCReluKernel<<<gridDim1, blockDim, 0, stream>>>(
-            net->d_W1, d_batch_input, d_batch_hidden, 
-            net->d_b1, HIDDEN_SIZE, INPUT_SIZE, batchSize);
-        
-        // Second layer: FC with tensor cores
-        dim3 gridDim2((OUTPUT_SIZE + TC_M - 1) / TC_M, 1, batchSize);
-        batchFCKernel<<<gridDim2, blockDim, 0, stream>>>(
-            net->d_W2, d_batch_hidden, d_batch_output,
-            net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, batchSize);
-    } 
-    else {
-        // Fall back to standard kernels for older GPUs
-        dim3 blockDim(1, 256);  // Using y dimension for row parallelism
-        
-        // First layer: FC + ReLU fused
-        dim3 gridDim1(1, (HIDDEN_SIZE + blockDim.y - 1) / blockDim.y, batchSize);
-        batchFCReluKernel<<<gridDim1, blockDim, 0, stream>>>(
-            net->d_W1, d_batch_input, d_batch_hidden, 
-            net->d_b1, HIDDEN_SIZE, INPUT_SIZE, batchSize);
-        
-        // Second layer: FC (no activation, will apply softmax after)
-        dim3 gridDim2(1, (OUTPUT_SIZE + blockDim.y - 1) / blockDim.y, batchSize);
-        batchFCKernel<<<gridDim2, blockDim, 0, stream>>>(
-            net->d_W2, d_batch_hidden, d_batch_output,
-            net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, batchSize);
+    if (idx < total) {
+        int row = idx % rows;
+        data[idx] += bias[row];
+        if (applyReLU) data[idx] = fmaxf(0.0f, data[idx]);
     }
+}
+
+// Fix forwardBatchTensorCore function - proper validation order and stream handling
+void forwardBatchTensorCore(NeuralNetwork* net, float* input, float* hidden, float* output, int batchSize, cudaStream_t stream = 0) {
+    if (!input || !hidden || !output || batchSize <= 0) return;
     
-    // Apply optimized softmax for small output vectors (same for both implementations)
-    batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(
-        d_batch_output, OUTPUT_SIZE, batchSize);
+    const float alpha = 1.0f, beta = 0.0f;
+    if (stream) CHECK_CUBLAS_ERROR(cublasSetStream(cublasHandle, stream));
+    
+    // First layer
+    CHECK_CUBLAS_ERROR(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, HIDDEN_SIZE, batchSize, INPUT_SIZE,
+                            &alpha, net->d_W1, HIDDEN_SIZE, input, INPUT_SIZE, &beta, hidden, HIDDEN_SIZE));
+    
+    addBiasWithOptionalReLU<<<(HIDDEN_SIZE * batchSize + 255) / 256, 256, 0, stream>>>(
+        hidden, net->d_b1, HIDDEN_SIZE, batchSize, true);
+    
+    // Second layer
+    CHECK_CUBLAS_ERROR(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, OUTPUT_SIZE, batchSize, HIDDEN_SIZE,
+                            &alpha, net->d_W2, OUTPUT_SIZE, hidden, HIDDEN_SIZE, &beta, output, OUTPUT_SIZE));
+    
+    addBiasWithOptionalReLU<<<(OUTPUT_SIZE * batchSize + 255) / 256, 256, 0, stream>>>(
+        output, net->d_b2, OUTPUT_SIZE, batchSize);
+    
+    batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(output, OUTPUT_SIZE, batchSize);
 }
 
 // Modified train function with prefetching
@@ -697,9 +531,9 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             
             // Process current batch
             cudaEventRecord(start, stream[curr_buf]);
-            forwardBatch(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
-                        d_batch_output[curr_buf], current_batch_size, stream[curr_buf]);
-                        
+            forwardBatchTensorCore(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
+                d_batch_output[curr_buf], current_batch_size, stream[curr_buf]);
+
             calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE, 0, stream[curr_buf]>>>(
                 d_batch_output[curr_buf], d_batch_target[curr_buf], d_loss, d_correct, current_batch_size);
             cudaEventRecord(stop, stream[curr_buf]);
@@ -709,9 +543,8 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             
             // Time backward pass
             cudaEventRecord(start, stream[curr_buf]);
-            batchBackward(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
-                         d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size, stream[curr_buf]);
-            cudaEventRecord(stop, stream[curr_buf]);
+            batchBackwardTensorCore(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
+                d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size, stream[curr_buf]);            cudaEventRecord(stop, stream[curr_buf]);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&milliseconds, start, stop);
             backwardTime += milliseconds;
@@ -750,12 +583,6 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     cudaFree(d_correct);
     free(indices);
 
-    // In main function or at the end of train function, add:
-    if (updateStream != NULL) {
-        cudaStreamSynchronize(updateStream);  // Wait for any pending updates to complete
-        cudaStreamDestroy(updateStream);
-        updateStream = NULL;
-    }
 }
 
 // Free network memory
@@ -775,10 +602,17 @@ void freeNetwork(NeuralNetwork* net) {
     free(net);
 }
 
-// Updated evaluate function
+// Fix evaluation function - add proper synchronization
 void evaluate(NeuralNetwork* net, float** h_images, float** h_labels, int numImages) {
-    const int batchSize = BATCH_SIZE;
+    printf("Evaluating...\n");
     
+    const int batchSize = BATCH_SIZE;
+    // Create dedicated stream for evaluation
+    cudaStream_t evalStream;
+    CHECK_CUDA_ERROR(cudaStreamCreate(&evalStream));
+    
+    CHECK_CUBLAS_ERROR(cublasSetMathMode(cublasHandle, CUBLAS_DEFAULT_MATH));
+
     // Allocate device memory for batches
     float *d_batch_input, *d_batch_hidden, *d_batch_output, *d_batch_target;
     CHECK_CUDA_ERROR(cudaMalloc(&d_batch_input, batchSize * INPUT_SIZE * sizeof(float)));
@@ -824,13 +658,20 @@ void evaluate(NeuralNetwork* net, float** h_images, float** h_labels, int numIma
         CHECK_CUDA_ERROR(cudaMemcpy(d_batch_target, h_batch_target,
             current_batch_size * OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
         
-        // Forward pass
-        forwardBatch(net, d_batch_input, d_batch_hidden, d_batch_output, current_batch_size);
+        // Forward pass with explicit stream
+        forwardBatchTensorCore(net, d_batch_input, d_batch_hidden, 
+            d_batch_output, current_batch_size, evalStream);
         
-        // Use d_loss instead of nullptr - this was causing the error
-        calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE>>>(
+        // Add synchronization before the next operation
+        cudaStreamSynchronize(evalStream);
+        
+        // Calculate loss and accuracy
+        calculateBatchLossAccuracy<<<min(64, current_batch_size), BLOCK_SIZE, 0, evalStream>>>(
             d_batch_output, d_batch_target, d_loss, d_correct, current_batch_size);
     }
+    
+    // Synchronize before retrieving results
+    cudaStreamSynchronize(evalStream);
     
     // Get final accuracy
     CHECK_CUDA_ERROR(cudaMemcpy(&h_correct, d_correct, sizeof(int), cudaMemcpyDeviceToHost));
@@ -845,8 +686,12 @@ void evaluate(NeuralNetwork* net, float** h_images, float** h_labels, int numIma
     cudaFreeHost(h_batch_input);
     cudaFreeHost(h_batch_target);
     
+    // Destroy the evaluation stream
+    cudaStreamDestroy(evalStream);
+    
     printf("Test Accuracy: %.2f%%\n", (h_correct / (float)numImages) * 100);
 }
+
 // Memory-mapped file loading for improved I/O performance
 float** loadMNISTImagesOptimized(const char* filename, int numImages) {
     int fd = open(filename, O_RDONLY);
@@ -930,6 +775,7 @@ float** loadMNISTLabelsOptimized(const char* filename, int numLabels) {
     
     return labels;
 }
+
 // Main function remains similar but with float arrays instead of double
 int main() {
     printf("MNIST Neural Network\n\n");
@@ -980,6 +826,7 @@ int main() {
     free(train_labels);
     free(test_images);
     free(test_labels);
-    
+    CHECK_CUBLAS_ERROR(cublasDestroy(cublasHandle));
+
     return 0;
 }
