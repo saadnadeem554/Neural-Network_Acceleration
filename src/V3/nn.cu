@@ -348,12 +348,20 @@ __global__ void batchUpdateParametersOptimized(float* d_W, float* d_b, float* d_
     }
 }
 
-// Optimized backward pass using more efficient kernels
+// Create a persistent update stream for asynchronous parameter updates
+static cudaStream_t updateStream = NULL;
+
+// Optimized backward pass with asynchronous parameter updates
 void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                  float* d_batch_output, float* d_batch_target, int batchSize) {
+                 float* d_batch_output, float* d_batch_target, int batchSize, cudaStream_t computeStream = 0) {
     // Allocate gradient matrices
     static float *d_W1_grad, *d_W2_grad, *d_b1_grad, *d_b2_grad;
     static bool gradients_initialized = false;
+    
+    // Initialize the update stream if this is the first call
+    if (updateStream == NULL) {
+        cudaStreamCreate(&updateStream);
+    }
     
     // Initialize gradient buffers if first call
     if (!gradients_initialized) {
@@ -365,32 +373,45 @@ void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidd
         gradients_initialized = true;
     }
     
-    // Clear gradients
-    cudaMemset(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float));
-    cudaMemset(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float));
-    cudaMemset(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float));
-    cudaMemset(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float));
+    // Clear gradients (in compute stream to ensure they're ready for the next gradient computation)
+    cudaMemsetAsync(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float), computeStream);
+    cudaMemsetAsync(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float), computeStream);
+    cudaMemsetAsync(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float), computeStream);
+    cudaMemsetAsync(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float), computeStream);
     
     // Compute gradients with optimized kernel - one block per batch item
     dim3 blockDim(256);
     dim3 gridDim(batchSize);
     
-    batchComputeGradientsOptimized<<<gridDim, blockDim>>>(
+    batchComputeGradientsOptimized<<<gridDim, blockDim, 0, computeStream>>>(
         d_batch_output, d_batch_target, d_batch_hidden, d_batch_input,
         d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
         net->d_W2, net->d_W1, batchSize
     );
     
-    // Update parameters with optimized kernel
-    batchUpdateParametersOptimized<<<32, 256>>>(
+    // Create an event to signal when gradient computation is done
+    cudaEvent_t gradientsDone;
+    cudaEventCreate(&gradientsDone);
+    cudaEventRecord(gradientsDone, computeStream);
+    
+    // Make the update stream wait for gradients computation to complete
+    cudaStreamWaitEvent(updateStream, gradientsDone, 0);
+    
+    // Asynchronously update parameters in the update stream
+    batchUpdateParametersOptimized<<<32, 256, 0, updateStream>>>(
         net->d_W1, net->d_b1, d_W1_grad, d_b1_grad,
         HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE, batchSize
     );
     
-    batchUpdateParametersOptimized<<<32, 256>>>(
+    batchUpdateParametersOptimized<<<32, 256, 0, updateStream>>>(
         net->d_W2, net->d_b2, d_W2_grad, d_b2_grad,
         OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE, batchSize
     );
+    
+    // Clean up the event
+    cudaEventDestroy(gradientsDone);
+    
+    // Note: We do NOT synchronize the update stream here, allowing it to proceed in the background
 }
 
 // Optimized forward pass using kernel fusion
@@ -573,7 +594,7 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             // Time backward pass
             cudaEventRecord(start, stream[curr_buf]);
             batchBackward(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
-                         d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size);
+                         d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size, stream[curr_buf]);
             cudaEventRecord(stop, stream[curr_buf]);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&milliseconds, start, stop);
@@ -612,6 +633,13 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     cudaFree(d_loss);
     cudaFree(d_correct);
     free(indices);
+
+    // In main function or at the end of train function, add:
+    if (updateStream != NULL) {
+        cudaStreamSynchronize(updateStream);  // Wait for any pending updates to complete
+        cudaStreamDestroy(updateStream);
+        updateStream = NULL;
+    }
 }
 
 // Free network memory
