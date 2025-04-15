@@ -3,6 +3,7 @@
 #include <math.h>
 #include <time.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 128
@@ -24,12 +25,19 @@
         } \
     } while(0)
 
-// Neural network structure for GPU
+// Neural network structure with mixed precision support
 typedef struct {
+    // Master weights (FP32)
     float *d_W1, *d_W2;    // Device weights
     float *d_b1, *d_b2;    // Device biases
-    float *h_W1, *h_W2;    // Host weights
-    float *h_b1, *h_b2;    // Host biases
+    
+    // Half precision copies for computation (FP16)
+    half *d_W1_half, *d_W2_half;  // Half precision weights
+    half *d_b1_half, *d_b2_half;  // Half precision biases
+    
+    // Host weights (only needed for initialization and final results)
+    float *h_W1, *h_W2;    
+    float *h_b1, *h_b2;    
 } NeuralNetwork;
 
 // Fused kernel for matrix multiplication + ReLU activation
