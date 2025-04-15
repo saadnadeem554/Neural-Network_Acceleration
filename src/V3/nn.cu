@@ -4,6 +4,10 @@
 #include <time.h>
 #include <cuda_runtime.h>
 #include <omp.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 128
@@ -71,27 +75,29 @@ __global__ void batchFCKernel(float* weights, float* inputs, float* outputs, flo
 
 
 
-// Optimized softmax kernel for small vectors (like OUTPUT_SIZE=10)
+// Optimized softmax kernel with register caching
 __global__ void batchSoftmaxSmallKernel(float* x, int size, int batchSize) {
     int batch = blockIdx.x;
     int tid = threadIdx.x;
     
     if (batch < batchSize) {
-        // Get pointer to this batch's data
+        // Cache batch offset in register
         float* batch_data = x + batch * size;
         
         // Use shared memory for this small array
-        __shared__ float data[32];  // Big enough for OUTPUT_SIZE = 10
+        __shared__ float data[32];
         __shared__ float max_val;
         __shared__ float sum_val;
         
-        // Load data into shared memory
+        // Load data into shared memory (and cache our value in register)
+        float my_val = 0.0f;
         if (tid < size) {
-            data[tid] = batch_data[tid];
+            my_val = batch_data[tid];
+            data[tid] = my_val;
         }
         __syncthreads();
         
-        // Find maximum with thread 0 (only need one thread for small size)
+        // Find maximum with thread 0
         if (tid == 0) {
             max_val = data[0];
             for (int i = 1; i < size; i++) {
@@ -100,9 +106,13 @@ __global__ void batchSoftmaxSmallKernel(float* x, int size, int batchSize) {
         }
         __syncthreads();
         
+        // Cache max value in register
+        float max_val_reg = max_val;
+        
         // Compute exp(x - max) and prepare for sum
         if (tid < size) {
-            data[tid] = expf(data[tid] - max_val);
+            float exp_val = expf(my_val - max_val_reg);
+            data[tid] = exp_val;
         }
         __syncthreads();
         
@@ -115,9 +125,12 @@ __global__ void batchSoftmaxSmallKernel(float* x, int size, int batchSize) {
         }
         __syncthreads();
         
+        // Cache sum in register
+        float sum_val_reg = sum_val;
+        
         // Normalize and write back
         if (tid < size) {
-            batch_data[tid] = data[tid] / sum_val;
+            batch_data[tid] = data[tid] / sum_val_reg;
         }
     }
 }
@@ -630,64 +643,6 @@ void evaluate(NeuralNetwork* net, float** h_images, float** h_labels, int numIma
     
     printf("Test Accuracy: %.2f%%\n", (h_correct / (float)numImages) * 100);
 }
-
-// Read MNIST dataset
-float** loadMNISTImages(const char* filename, int numImages) {
-    FILE* file = fopen(filename, "rb");
-    if (!file) {
-        printf("Error opening %s\n", filename);
-        exit(1);
-    }
-    fseek(file, 16, SEEK_SET);
-    float** images = allocateMatrix(numImages, INPUT_SIZE);
-    for (int i = 0; i < numImages; i++) {
-        for (int j = 0; j < INPUT_SIZE; j++) {
-            unsigned char pixel;
-
-            // fread(&pixel, sizeof(unsigned char), 1, file);
-            if (fread(&pixel, sizeof(unsigned char), 1, file) != 1) {
-                fprintf(stderr, "Error: Failed to read pixel\n");
-                fclose(file);
-                exit(EXIT_FAILURE);
-            }
-
-            images[i][j] = pixel / 255.0;
-        }
-    }
-    fclose(file);
-    return images;
-}
-
-
-float** loadMNISTLabels(const char* filename, int numLabels) {
-    FILE* file = fopen(filename, "rb");
-    if (!file) {
-        printf("Error opening %s\n", filename);
-        exit(1);
-    }
-    fseek(file, 8, SEEK_SET);
-    float** labels = allocateMatrix(numLabels, OUTPUT_SIZE);
-    for (int i = 0; i < numLabels; i++) {
-        unsigned char label;
-        // fread(&label, sizeof(unsigned char), 1, file);
-        if (fread(&label, sizeof(unsigned char), 1, file) != 1) {
-            fprintf(stderr, "Error: Failed to read label\n");
-            fclose(file);
-            exit(EXIT_FAILURE);
-        }
-
-        for (int j = 0; j < OUTPUT_SIZE; j++) {
-            labels[i][j] = (j == label) ? 1.0 : 0.0;
-        }
-    }
-    fclose(file);
-    return labels;
-}
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-
 // Memory-mapped file loading for improved I/O performance
 float** loadMNISTImagesOptimized(const char* filename, int numImages) {
     int fd = open(filename, O_RDONLY);
