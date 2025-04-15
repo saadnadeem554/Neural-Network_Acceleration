@@ -32,27 +32,43 @@ typedef struct {
     float *h_b1, *h_b2;    // Host biases
 } NeuralNetwork;
 
-// Fix 1: Correct batch matrix multiplication kernel
-__global__ void batchMatrixMulKernel(float* A, float* B, float* C, float* bias,
-                                   int M, int N, int K, int batchSize) {
+// Fused kernel for matrix multiplication + ReLU activation
+__global__ void batchFCReluKernel(float* weights, float* inputs, float* outputs, float* bias,
+                               int output_size, int input_size, int batch_size) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
     int batch = blockIdx.z;
     
-    if (batch < batchSize && row < M && col < K) {
-        // For each output element, compute dot product of row of A and column of B
+    if (batch < batch_size && row < output_size) {
         float sum = bias[row];
         
-        // B is now treated as a batch of matrices
-        // Each batch element B[batch] is a matrix of shape NxK
-        for (int i = 0; i < N; i++) {
-            // A[row, i] * B[batch, i, col]
-            sum += A[row * N + i] * B[batch * (N * K) + i * K + col];
+        for (int i = 0; i < input_size; i++) {
+            sum += weights[row * input_size + i] * inputs[batch * input_size + i];
         }
         
-        C[batch * M * K + row * K + col] = sum;
+        // Apply ReLU directly
+        outputs[batch * output_size + row] = fmaxf(0.0f, sum);
     }
 }
+
+// Kernel for matrix multiplication + linear (no activation)
+__global__ void batchFCKernel(float* weights, float* inputs, float* outputs, float* bias,
+                           int output_size, int input_size, int batch_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int batch = blockIdx.z;
+    
+    if (batch < batch_size && row < output_size) {
+        float sum = bias[row];
+        
+        for (int i = 0; i < input_size; i++) {
+            sum += weights[row * input_size + i] * inputs[batch * input_size + i];
+        }
+        
+        // No activation
+        outputs[batch * output_size + row] = sum;
+    }
+}
+
+
 
 // CUDA kernel for ReLU activation for batches
 __global__ void batchReluKernel(float* x, int size, int batchSize) {
@@ -116,6 +132,57 @@ __global__ void batchSoftmaxKernel(float* x, int size, int batchSize) {
         // Normalize by sum
         for (int i = threadIdx.x; i < size; i += blockDim.x) {
             batch_data[i] /= shared_sum;
+        }
+    }
+}
+
+// Optimized softmax kernel for small vectors (like OUTPUT_SIZE=10)
+__global__ void batchSoftmaxSmallKernel(float* x, int size, int batchSize) {
+    int batch = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (batch < batchSize) {
+        // Get pointer to this batch's data
+        float* batch_data = x + batch * size;
+        
+        // Use shared memory for this small array
+        __shared__ float data[32];  // Big enough for OUTPUT_SIZE = 10
+        __shared__ float max_val;
+        __shared__ float sum_val;
+        
+        // Load data into shared memory
+        if (tid < size) {
+            data[tid] = batch_data[tid];
+        }
+        __syncthreads();
+        
+        // Find maximum with thread 0 (only need one thread for small size)
+        if (tid == 0) {
+            max_val = data[0];
+            for (int i = 1; i < size; i++) {
+                max_val = fmaxf(max_val, data[i]);
+            }
+        }
+        __syncthreads();
+        
+        // Compute exp(x - max) and prepare for sum
+        if (tid < size) {
+            data[tid] = expf(data[tid] - max_val);
+        }
+        __syncthreads();
+        
+        // Compute sum with reduction
+        if (tid == 0) {
+            sum_val = 0.0f;
+            for (int i = 0; i < size; i++) {
+                sum_val += data[i];
+            }
+        }
+        __syncthreads();
+        
+        // Normalize and write back
+        if (tid < size) {
+            batch_data[tid] = data[tid] / sum_val;
         }
     }
 }
@@ -238,15 +305,15 @@ NeuralNetwork* createNetwork() {
     return net;
 }
 
-// Batch version of computeGradients kernel
-__global__ void batchComputeGradients(float* d_batch_output, float* d_batch_target, 
-                                    float* d_batch_hidden, float* d_batch_input,
-                                    float* d_W2_grad, float* d_b2_grad,
-                                    float* d_W1_grad, float* d_b1_grad,
-                                    float* d_W2, float* d_W1,
-                                    int batchSize) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int batch = blockIdx.y;
+// Optimized gradient computation kernel
+__global__ void batchComputeGradientsOptimized(float* d_batch_output, float* d_batch_target, 
+                                           float* d_batch_hidden, float* d_batch_input,
+                                           float* d_W2_grad, float* d_b2_grad,
+                                           float* d_W1_grad, float* d_b1_grad,
+                                           float* d_W2, float* d_W1,
+                                           int batchSize) {
+    int tid = threadIdx.x;
+    int batch = blockIdx.x;
     
     if (batch >= batchSize) return;
     
@@ -256,65 +323,77 @@ __global__ void batchComputeGradients(float* d_batch_output, float* d_batch_targ
     float* hidden = d_batch_hidden + batch * HIDDEN_SIZE;
     float* input = d_batch_input + batch * INPUT_SIZE;
     
-    // Output layer gradients
-    if (idx < OUTPUT_SIZE) {
-        float output_error = output[idx] - target[idx];
+    // Use shared memory to compute and store output errors
+    __shared__ float output_errors[32];  // Enough for OUTPUT_SIZE=10
+    
+    // Calculate output errors in parallel
+    if (tid < OUTPUT_SIZE) {
+        output_errors[tid] = output[tid] - target[tid];
         
-        // Accumulate bias gradients (one per batch item)
-        atomicAdd(&d_b2_grad[idx], output_error);
-        
-        // Accumulate weight gradients
-        for (int j = 0; j < HIDDEN_SIZE; j++) {
-            atomicAdd(&d_W2_grad[idx * HIDDEN_SIZE + j], output_error * hidden[j]);
-        }
+        // Update bias gradient
+        atomicAdd(&d_b2_grad[tid], output_errors[tid]);
+    }
+    __syncthreads();
+    
+    // Each thread updates a subset of W2 gradients
+    for (int i = tid; i < OUTPUT_SIZE * HIDDEN_SIZE; i += blockDim.x) {
+        int out_idx = i / HIDDEN_SIZE;
+        int hid_idx = i % HIDDEN_SIZE;
+        atomicAdd(&d_W2_grad[i], output_errors[out_idx] * hidden[hid_idx]);
     }
     
-    // Hidden layer gradients
-    if (idx < HIDDEN_SIZE) {
-        float hidden_error = 0.0f;
-        
-        // Calculate error at hidden layer
-        for (int j = 0; j < OUTPUT_SIZE; j++) {
-            hidden_error += (output[j] - target[j]) * d_W2[j * HIDDEN_SIZE + idx];
+    // Compute hidden layer errors
+    __shared__ float hidden_errors[128];  // Maximum HIDDEN_SIZE we'd expect
+    
+    // First initialize all to zero
+    for (int i = tid; i < HIDDEN_SIZE; i += blockDim.x) {
+        hidden_errors[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Compute hidden errors in parallel across threads
+    for (int i = 0; i < OUTPUT_SIZE; i++) {
+        for (int j = tid; j < HIDDEN_SIZE; j += blockDim.x) {
+            hidden_errors[j] += output_errors[i] * d_W2[i * HIDDEN_SIZE + j];
         }
-        
-        // Apply ReLU derivative
-        hidden_error *= (hidden[idx] > 0.0f);
-        
-        // Accumulate bias gradients
-        atomicAdd(&d_b1_grad[idx], hidden_error);
-        
-        // Accumulate weight gradients
-        for (int j = 0; j < INPUT_SIZE; j++) {
-            atomicAdd(&d_W1_grad[idx * INPUT_SIZE + j], hidden_error * input[j]);
-        }
+    }
+    __syncthreads();
+    
+    // Apply ReLU derivative and update bias gradients
+    for (int i = tid; i < HIDDEN_SIZE; i += blockDim.x) {
+        hidden_errors[i] *= (hidden[i] > 0.0f);
+        atomicAdd(&d_b1_grad[i], hidden_errors[i]);
+    }
+    __syncthreads();
+    
+    // Each thread updates a subset of W1 gradients
+    for (int i = tid; i < HIDDEN_SIZE * INPUT_SIZE; i += blockDim.x) {
+        int hid_idx = i / INPUT_SIZE;
+        int in_idx = i % INPUT_SIZE;
+        atomicAdd(&d_W1_grad[i], hidden_errors[hid_idx] * input[in_idx]);
     }
 }
 
-// Batch version of parameter updates
-__global__ void batchUpdateParameters(float* d_W, float* d_b, float* d_W_grad, 
-                                    float* d_b_grad, int rows, int cols, 
-                                    float learning_rate, int batchSize) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+// Optimized parameter update kernel
+__global__ void batchUpdateParametersOptimized(float* d_W, float* d_b, float* d_W_grad, 
+                                           float* d_b_grad, int rows, int cols, 
+                                           float learning_rate, int batchSize) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
     
-    // Update weights
-    if (idx < rows * cols) {
-        // Normalize by batch size and apply learning rate
-        d_W[idx] -= (learning_rate / batchSize) * d_W_grad[idx];
-        // Reset gradient for next batch
-        d_W_grad[idx] = 0.0f;
+    // Each thread updates multiple weights using grid-stride loop
+    for (int i = tid; i < rows * cols; i += blockDim.x * gridDim.x) {
+        d_W[i] -= (learning_rate / batchSize) * d_W_grad[i];
+        d_W_grad[i] = 0.0f;  // Reset gradient for next batch
     }
     
-    // Update biases
-    if (idx < rows) {
-        // Normalize by batch size and apply learning rate
-        d_b[idx] -= (learning_rate / batchSize) * d_b_grad[idx];
-        // Reset gradient for next batch
-        d_b_grad[idx] = 0.0f;
+    // Update biases with efficient access pattern
+    if (tid < rows) {
+        d_b[tid] -= (learning_rate / batchSize) * d_b_grad[tid];
+        d_b_grad[tid] = 0.0f;  // Reset gradient for next batch
     }
 }
 
-// New batched backward function
+// Optimized backward pass using more efficient kernels
 void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
                   float* d_batch_output, float* d_batch_target, int batchSize) {
     // Allocate gradient matrices
@@ -331,73 +410,54 @@ void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidd
         gradients_initialized = true;
     }
     
-    // Clear gradients before accumulating new ones - this is critical!
+    // Clear gradients
     cudaMemset(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float));
     cudaMemset(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float));
     cudaMemset(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float));
     cudaMemset(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float));
     
-    // Compute gradients for batch
+    // Compute gradients with optimized kernel - one block per batch item
     dim3 blockDim(256);
-    dim3 gridDim(max(1, (max(OUTPUT_SIZE, HIDDEN_SIZE) + blockDim.x - 1) / blockDim.x), batchSize);
+    dim3 gridDim(batchSize);
     
-    batchComputeGradients<<<gridDim, blockDim>>>(
+    batchComputeGradientsOptimized<<<gridDim, blockDim>>>(
         d_batch_output, d_batch_target, d_batch_hidden, d_batch_input,
         d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
         net->d_W2, net->d_W1, batchSize
     );
     
-    // Update parameters
-    dim3 updateBlockDim(256);
-    dim3 updateGridDim((max(HIDDEN_SIZE * INPUT_SIZE, OUTPUT_SIZE * HIDDEN_SIZE) + 
-                      updateBlockDim.x - 1) / updateBlockDim.x);
-                      
-    batchUpdateParameters<<<updateGridDim, updateBlockDim>>>(
+    // Update parameters with optimized kernel
+    batchUpdateParametersOptimized<<<32, 256>>>(
         net->d_W1, net->d_b1, d_W1_grad, d_b1_grad,
         HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE, batchSize
     );
     
-    batchUpdateParameters<<<updateGridDim, updateBlockDim>>>(
+    batchUpdateParametersOptimized<<<32, 256>>>(
         net->d_W2, net->d_b2, d_W2_grad, d_b2_grad,
         OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE, batchSize
     );
 }
 
-// Remove debug messages and error checks that aren't needed anymore
+// Optimized forward pass using kernel fusion
 void forwardBatch(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
                  float* d_batch_output, int batchSize, cudaStream_t stream = 0) {
-    // First layer: Hidden = W1 * Input + b1
-    dim3 blockDim(16, 16);
+    // Set block dimensions for FC layers
+    dim3 blockDim(1, 256);  // Using y dimension for row parallelism
     
-    // For hidden layer, output is of size (batchSize, HIDDEN_SIZE)
-    dim3 gridDim;
-    
-    // K=1 for matrix-vector multiplication (1 column per result)
-    gridDim.x = 1;  // K=1 so only 1 column
-    gridDim.y = (HIDDEN_SIZE + blockDim.y - 1) / blockDim.y;  // Rows
-    gridDim.z = batchSize;  // Batch dimension
-    
-    // First layer: FC + ReLU
-    batchMatrixMulKernel<<<gridDim, blockDim, 0, stream>>>(
+    // First layer: FC + ReLU fused
+    dim3 gridDim1(1, (HIDDEN_SIZE + blockDim.y - 1) / blockDim.y, batchSize);
+    batchFCReluKernel<<<gridDim1, blockDim, 0, stream>>>(
         net->d_W1, d_batch_input, d_batch_hidden, 
-        net->d_b1, HIDDEN_SIZE, INPUT_SIZE, 1, batchSize);
+        net->d_b1, HIDDEN_SIZE, INPUT_SIZE, batchSize);
     
-    // Apply ReLU to the hidden layer outputs
-    dim3 reluGrid((HIDDEN_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE, batchSize);
-    batchReluKernel<<<reluGrid, BLOCK_SIZE, 0, stream>>>(
-        d_batch_hidden, HIDDEN_SIZE, batchSize);
-    
-    // Output layer: Output = W2 * Hidden + b2
-    gridDim.x = 1;  // K=1 (single column output)
-    gridDim.y = (OUTPUT_SIZE + blockDim.y - 1) / blockDim.y;  // Rows
-    gridDim.z = batchSize;  // Batch dimension
-    
-    batchMatrixMulKernel<<<gridDim, blockDim, 0, stream>>>(
+    // Second layer: FC (no activation, will apply softmax after)
+    dim3 gridDim2(1, (OUTPUT_SIZE + blockDim.y - 1) / blockDim.y, batchSize);
+    batchFCKernel<<<gridDim2, blockDim, 0, stream>>>(
         net->d_W2, d_batch_hidden, d_batch_output,
-        net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, 1, batchSize);
+        net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, batchSize);
     
-    // Apply softmax to each sample in the batch
-    batchSoftmaxKernel<<<batchSize, BLOCK_SIZE, 0, stream>>>(
+    // Apply optimized softmax for small output vectors
+    batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(
         d_batch_output, OUTPUT_SIZE, batchSize);
 }
 
@@ -406,36 +466,41 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     const int batchSize = BATCH_SIZE;
     const int numBatches = (numImages + batchSize - 1) / batchSize;
     
-    // Allocate device memory for batches
+    // CUDA events for timing
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float milliseconds = 0;
+    
+    // Allocate device memory
     float *d_batch_input, *d_batch_hidden, *d_batch_output, *d_batch_target;
     CHECK_CUDA_ERROR(cudaMalloc(&d_batch_input, batchSize * INPUT_SIZE * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_batch_hidden, batchSize * HIDDEN_SIZE * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_batch_output, batchSize * OUTPUT_SIZE * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_batch_target, batchSize * OUTPUT_SIZE * sizeof(float)));
     
-    // Allocate device memory for metrics
+    // Allocate metrics memory
     float *d_loss;
     int *d_correct;
     CHECK_CUDA_ERROR(cudaMalloc(&d_loss, sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_correct, sizeof(int)));
     
     // Use page-locked memory for faster transfers
-    float *h_batch_data;  // Combined buffer for both input and target data
+    float *h_batch_data;  // Combined buffer for input and target
     size_t input_bytes = batchSize * INPUT_SIZE * sizeof(float);
     size_t target_bytes = batchSize * OUTPUT_SIZE * sizeof(float);
     CHECK_CUDA_ERROR(cudaMallocHost(&h_batch_data, input_bytes + target_bytes));
     
-    // Create pointers to the appropriate sections of the combined buffer
     float *h_batch_input = h_batch_data;
     float *h_batch_target = h_batch_data + batchSize * INPUT_SIZE;
     
-    // Create and initialize index array for shuffling
+    // Create index array for shuffling
     int* indices = (int*)malloc(numImages * sizeof(int));
     for (int i = 0; i < numImages; i++) {
         indices[i] = i;
     }
     
-    // Set up CUDA streams for overlapping operations
+    // Create CUDA stream
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     
@@ -447,8 +512,9 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
         CHECK_CUDA_ERROR(cudaMemcpy(d_correct, &h_correct, sizeof(int), cudaMemcpyHostToDevice));
         
         clock_t epoch_start = clock();
+        float transferTime = 0, forwardTime = 0, backwardTime = 0;
         
-        // Shuffle data indices for this epoch
+        // Shuffle data indices
         for (int i = numImages - 1; i > 0; i--) {
             int j = rand() % (i + 1);
             int temp = indices[i];
@@ -461,22 +527,21 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             int start_idx = batch * batchSize;
             int current_batch_size = min(batchSize, numImages - start_idx);
             
-            // Pack all batch data at once (input and target together)
+            // Prepare batch data
             for (int i = 0; i < current_batch_size; i++) {
                 int idx = indices[start_idx + i];
                 
-                // Copy input data
                 memcpy(h_batch_input + i * INPUT_SIZE, 
                        h_images[idx], 
                        INPUT_SIZE * sizeof(float));
                        
-                // Copy target data
                 memcpy(h_batch_target + i * OUTPUT_SIZE, 
                        h_labels[idx], 
                        OUTPUT_SIZE * sizeof(float));
             }
             
-            // Combine transfers using a single stream for pipelining
+            // Time transfer
+            cudaEventRecord(start, stream);
             cudaMemcpyAsync(d_batch_input, h_batch_input,
                 current_batch_size * INPUT_SIZE * sizeof(float), 
                 cudaMemcpyHostToDevice, stream);
@@ -484,19 +549,28 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             cudaMemcpyAsync(d_batch_target, h_batch_target,
                 current_batch_size * OUTPUT_SIZE * sizeof(float), 
                 cudaMemcpyHostToDevice, stream);
-                
-            // Ensure transfers complete before proceeding
-            cudaStreamSynchronize(stream);
-                
-            // Forward pass
-            forwardBatch(net, d_batch_input, d_batch_hidden, d_batch_output, current_batch_size, stream);
+            cudaEventRecord(stop, stream);
+            cudaEventSynchronize(stop);
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            transferTime += milliseconds;
             
-            // Calculate metrics on GPU
+            // Time forward pass
+            cudaEventRecord(start, stream);
+            forwardBatch(net, d_batch_input, d_batch_hidden, d_batch_output, current_batch_size, stream);
             calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE, 0, stream>>>(
                 d_batch_output, d_batch_target, d_loss, d_correct, current_batch_size);
+            cudaEventRecord(stop, stream);
+            cudaEventSynchronize(stop);
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            forwardTime += milliseconds;
             
-            // Backward pass
+            // Time backward pass
+            cudaEventRecord(start, stream);
             batchBackward(net, d_batch_input, d_batch_hidden, d_batch_output, d_batch_target, current_batch_size);
+            cudaEventRecord(stop, stream);
+            cudaEventSynchronize(stop);
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            backwardTime += milliseconds;
         }
         
         // Get final metrics
@@ -506,9 +580,14 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
         printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
                epoch + 1, h_loss / numImages, (h_correct / (float)numImages) * 100,
                (float)(clock() - epoch_start) / CLOCKS_PER_SEC);
+               
+        printf("  Transfer: %.2f ms, Forward: %.2f ms, Backward: %.2f ms\n",
+               transferTime, forwardTime, backwardTime);
     }
     
     // Clean up
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     cudaStreamDestroy(stream);
     cudaFree(d_batch_input);
     cudaFree(d_batch_hidden);
@@ -516,7 +595,7 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     cudaFree(d_batch_target);
     cudaFree(d_loss);
     cudaFree(d_correct);
-    cudaFreeHost(h_batch_data);  // Free the combined buffer
+    cudaFreeHost(h_batch_data);
     free(indices);
 }
 
@@ -685,6 +764,10 @@ int main() {
     train(net, train_images, train_labels, 60000);
     end = clock();
     printf("Time to train: %.3fs\n", (double)(end - start) / CLOCKS_PER_SEC);
+
+    // Measure time for evaluation
+    start = clock();
+    evaluate(net, test_images, test_labels, 10000);
 
     // Measure time for evaluation
     start = clock();
