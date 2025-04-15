@@ -416,7 +416,7 @@ void forwardBatch(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidde
         d_batch_output, OUTPUT_SIZE, batchSize);
 }
 
-// Modified train function with full batch processing
+// Modified train function with prefetching
 void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages) {
     const int batchSize = BATCH_SIZE;
     const int numBatches = (numImages + batchSize - 1) / batchSize;
@@ -427,12 +427,16 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     cudaEventCreate(&stop);
     float milliseconds = 0;
     
-    // Allocate device memory
-    float *d_batch_input, *d_batch_hidden, *d_batch_output, *d_batch_target;
-    CHECK_CUDA_ERROR(cudaMalloc(&d_batch_input, batchSize * INPUT_SIZE * sizeof(float)));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_batch_hidden, batchSize * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_batch_output, batchSize * OUTPUT_SIZE * sizeof(float)));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_batch_target, batchSize * OUTPUT_SIZE * sizeof(float)));
+    // Double buffering for prefetching
+    float *d_batch_input[2], *d_batch_hidden[2], *d_batch_output[2], *d_batch_target[2];
+    
+    // Allocate two sets of device memory for double buffering
+    for (int i = 0; i < 2; i++) {
+        CHECK_CUDA_ERROR(cudaMalloc(&d_batch_input[i], batchSize * INPUT_SIZE * sizeof(float)));
+        CHECK_CUDA_ERROR(cudaMalloc(&d_batch_hidden[i], batchSize * HIDDEN_SIZE * sizeof(float)));
+        CHECK_CUDA_ERROR(cudaMalloc(&d_batch_output[i], batchSize * OUTPUT_SIZE * sizeof(float)));
+        CHECK_CUDA_ERROR(cudaMalloc(&d_batch_target[i], batchSize * OUTPUT_SIZE * sizeof(float)));
+    }
     
     // Allocate metrics memory
     float *d_loss;
@@ -440,14 +444,16 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     CHECK_CUDA_ERROR(cudaMalloc(&d_loss, sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_correct, sizeof(int)));
     
-    // Use page-locked memory for faster transfers
-    float *h_batch_data;  // Combined buffer for input and target
-    size_t input_bytes = batchSize * INPUT_SIZE * sizeof(float);
-    size_t target_bytes = batchSize * OUTPUT_SIZE * sizeof(float);
-    CHECK_CUDA_ERROR(cudaMallocHost(&h_batch_data, input_bytes + target_bytes));
+    // Use page-locked memory for faster transfers (also double-buffered)
+    float *h_batch_data[2];
+    CHECK_CUDA_ERROR(cudaMallocHost(&h_batch_data[0], batchSize * (INPUT_SIZE + OUTPUT_SIZE) * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMallocHost(&h_batch_data[1], batchSize * (INPUT_SIZE + OUTPUT_SIZE) * sizeof(float)));
     
-    float *h_batch_input = h_batch_data;
-    float *h_batch_target = h_batch_data + batchSize * INPUT_SIZE;
+    float *h_batch_input[2], *h_batch_target[2];
+    for (int i = 0; i < 2; i++) {
+        h_batch_input[i] = h_batch_data[i];
+        h_batch_target[i] = h_batch_data[i] + batchSize * INPUT_SIZE;
+    }
     
     // Create index array for shuffling
     int* indices = (int*)malloc(numImages * sizeof(int));
@@ -455,9 +461,10 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
         indices[i] = i;
     }
     
-    // Create CUDA stream
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    // Create two CUDA streams for overlapping operations
+    cudaStream_t stream[2];
+    cudaStreamCreate(&stream[0]);
+    cudaStreamCreate(&stream[1]);
     
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         // Reset metrics
@@ -477,52 +484,97 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             indices[j] = temp;
         }
         
-        // Train in batches
+        // Prepare first batch before the main loop
+        int current_batch_size = min(batchSize, numImages);
+        int idx_buf = 0;  // Start with buffer 0
+        
+        // Prepare the first batch data
+        for (int i = 0; i < current_batch_size; i++) {
+            int idx = indices[i];
+            
+            memcpy(h_batch_input[idx_buf] + i * INPUT_SIZE, 
+                   h_images[idx], 
+                   INPUT_SIZE * sizeof(float));
+                   
+            memcpy(h_batch_target[idx_buf] + i * OUTPUT_SIZE, 
+                   h_labels[idx], 
+                   OUTPUT_SIZE * sizeof(float));
+        }
+        
+        // Start first batch transfer
+        cudaEventRecord(start, stream[idx_buf]);
+        cudaMemcpyAsync(d_batch_input[idx_buf], h_batch_input[idx_buf],
+            current_batch_size * INPUT_SIZE * sizeof(float), 
+            cudaMemcpyHostToDevice, stream[idx_buf]);
+            
+        cudaMemcpyAsync(d_batch_target[idx_buf], h_batch_target[idx_buf],
+            current_batch_size * OUTPUT_SIZE * sizeof(float), 
+            cudaMemcpyHostToDevice, stream[idx_buf]);
+        cudaEventRecord(stop, stream[idx_buf]);
+        
+        // Train in batches with prefetching
         for (int batch = 0; batch < numBatches; batch++) {
             int start_idx = batch * batchSize;
-            int current_batch_size = min(batchSize, numImages - start_idx);
+            current_batch_size = min(batchSize, numImages - start_idx);
             
-            // Prepare batch data
-            for (int i = 0; i < current_batch_size; i++) {
-                int idx = indices[start_idx + i];
-                
-                memcpy(h_batch_input + i * INPUT_SIZE, 
-                       h_images[idx], 
-                       INPUT_SIZE * sizeof(float));
-                       
-                memcpy(h_batch_target + i * OUTPUT_SIZE, 
-                       h_labels[idx], 
-                       OUTPUT_SIZE * sizeof(float));
-            }
+            // Current buffer index
+            int curr_buf = idx_buf;
             
-            // Time transfer
-            cudaEventRecord(start, stream);
-            cudaMemcpyAsync(d_batch_input, h_batch_input,
-                current_batch_size * INPUT_SIZE * sizeof(float), 
-                cudaMemcpyHostToDevice, stream);
-                
-            cudaMemcpyAsync(d_batch_target, h_batch_target,
-                current_batch_size * OUTPUT_SIZE * sizeof(float), 
-                cudaMemcpyHostToDevice, stream);
-            cudaEventRecord(stop, stream);
+            // Next buffer index (for prefetching)
+            idx_buf = 1 - idx_buf;
+            
+            // Wait for current transfer to complete
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&milliseconds, start, stop);
             transferTime += milliseconds;
             
-            // Time forward pass
-            cudaEventRecord(start, stream);
-            forwardBatch(net, d_batch_input, d_batch_hidden, d_batch_output, current_batch_size, stream);
-            calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE, 0, stream>>>(
-                d_batch_output, d_batch_target, d_loss, d_correct, current_batch_size);
-            cudaEventRecord(stop, stream);
+            // Start preparing next batch data (if not the last batch)
+            if (batch + 1 < numBatches) {
+                int next_start_idx = (batch + 1) * batchSize;
+                int next_batch_size = min(batchSize, numImages - next_start_idx);
+                
+                // Prepare next batch in the other buffer
+                for (int i = 0; i < next_batch_size; i++) {
+                    int idx = indices[next_start_idx + i];
+                    
+                    memcpy(h_batch_input[idx_buf] + i * INPUT_SIZE, 
+                           h_images[idx], 
+                           INPUT_SIZE * sizeof(float));
+                           
+                    memcpy(h_batch_target[idx_buf] + i * OUTPUT_SIZE, 
+                           h_labels[idx], 
+                           OUTPUT_SIZE * sizeof(float));
+                }
+                
+                // Start next batch transfer (overlapped with current computation)
+                cudaEventRecord(start, stream[idx_buf]);
+                cudaMemcpyAsync(d_batch_input[idx_buf], h_batch_input[idx_buf],
+                    next_batch_size * INPUT_SIZE * sizeof(float), 
+                    cudaMemcpyHostToDevice, stream[idx_buf]);
+                    
+                cudaMemcpyAsync(d_batch_target[idx_buf], h_batch_target[idx_buf],
+                    next_batch_size * OUTPUT_SIZE * sizeof(float), 
+                    cudaMemcpyHostToDevice, stream[idx_buf]);
+                cudaEventRecord(stop, stream[idx_buf]);
+            }
+            
+            // Process current batch
+            cudaEventRecord(start, stream[curr_buf]);
+            forwardBatch(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
+                        d_batch_output[curr_buf], current_batch_size, stream[curr_buf]);
+                        
+            calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE, 0, stream[curr_buf]>>>(
+                d_batch_output[curr_buf], d_batch_target[curr_buf], d_loss, d_correct, current_batch_size);
+            cudaEventRecord(stop, stream[curr_buf]);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&milliseconds, start, stop);
             forwardTime += milliseconds;
             
             // Time backward pass
-            cudaEventRecord(start, stream);
-            batchBackward(net, d_batch_input, d_batch_hidden, d_batch_output, d_batch_target, current_batch_size);
-            cudaEventRecord(stop, stream);
+            cudaEventRecord(start, stream[curr_buf]);
+            batchBackward(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
+                         d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size);
+            cudaEventRecord(stop, stream[curr_buf]);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&milliseconds, start, stop);
             backwardTime += milliseconds;
@@ -543,14 +595,22 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
     // Clean up
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    cudaStreamDestroy(stream);
-    cudaFree(d_batch_input);
-    cudaFree(d_batch_hidden);
-    cudaFree(d_batch_output);
-    cudaFree(d_batch_target);
+    
+    // Clean up streams
+    cudaStreamDestroy(stream[0]);
+    cudaStreamDestroy(stream[1]);
+    
+    // Free double-buffered memory
+    for (int i = 0; i < 2; i++) {
+        cudaFree(d_batch_input[i]);
+        cudaFree(d_batch_hidden[i]);
+        cudaFree(d_batch_output[i]);
+        cudaFree(d_batch_target[i]);
+        cudaFreeHost(h_batch_data[i]);
+    }
+    
     cudaFree(d_loss);
     cudaFree(d_correct);
-    cudaFreeHost(h_batch_data);
     free(indices);
 }
 
