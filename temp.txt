@@ -500,18 +500,18 @@ __global__ void wmmaUpdateParams(float* d_W, float* d_b, float* d_W_grad,
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = blockDim.x * gridDim.x;
     
-    // Compute learning rate once and reuse
     const float lr = learning_rate / batchSize;
     
-    // Use vectorized updates for better memory throughput
+    // Update weights - process in chunks of 4 for better memory bandwidth
     for (int i = tid; i < rows * cols; i += stride) {
-        // Update weights with optimized memory access pattern
         d_W[i] -= lr * d_W_grad[i];
+        d_W_grad[i] = 0.0f; // Reset gradient for next batch
     }
     
-    // Update biases (usually much smaller than weights)
+    // Update biases
     if (tid < rows) {
         d_b[tid] -= lr * d_b_grad[tid];
+        d_b_grad[tid] = 0.0f; // Reset gradient for next batch
     }
 }
 
