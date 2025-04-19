@@ -8,12 +8,13 @@ V1_DIR = V1
 V2_DIR = V2
 V3_DIR = V3
 V4_DIR = V4
-
+V6_DIR = V6
 # Executables
 V1_EXE = $(V1_DIR)/nn.exe
 V2_EXE = $(V2_DIR)/nn_cuda.exe
 V3_EXE = $(V3_DIR)/nn_optimized.exe
-V4_EXE = $(V4_DIR)/nn_tensor.exez
+V4_EXE = $(V4_DIR)/nn_tensor.exe
+V6_EXE = $(V6_DIR)/nn_tensor_optimized.exe
 
 # Default target
 all: v1
@@ -44,7 +45,13 @@ v4: $(V4_EXE)
 	./$(V4_EXE)
 
 $(V4_EXE): $(V4_DIR)/nn.cu
-	$(NVCC) $(CUDAFLAGS) -o $(V4_EXE) $(V4_DIR)/nn.cu -lm -lcublas
+	$(NVCC) $(CUDAFLAGS) -o $(V4_EXE) $(V4_DIR)/nn.cu -lm
+
+# Version 6: Optimized Tensor Core Implementation with CUBLAS
+v6: $(V6_EXE)
+	./$(V6_EXE)
+$(V6_EXE): $(V6_DIR)/nn.cu
+	$(NVCC) $(CUDAFLAGS) -o $(V6_EXE) $(V6_DIR)/nn.cu -lm -lcublas 
 
 # Clean all executables
 clean:
