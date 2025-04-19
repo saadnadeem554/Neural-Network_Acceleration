@@ -407,57 +407,30 @@ NeuralNetwork* createNetwork() {
     return net;
 }
 
-// Simplified forward pass using tensor cores
 void forwardBatchTensorCore(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
                         float* d_batch_output, int batchSize, cudaStream_t stream = 0) {
-    // Process each batch element individually
-    for (int batch_idx = 0; batch_idx < batchSize; batch_idx++) {
-        // First layer: W1 * input + b1
-        // Configure grid dimensions for the first layer
-        dim3 blockDim1(32);  // One warp per block
-        dim3 gridDim1((HIDDEN_SIZE + WMMA_M - 1) / WMMA_M, 1);  // One column
-        
-        wmmaMatrixMulKernel<<<gridDim1, blockDim1, 0, stream>>>(
-            net->d_W1,                                // Weight matrix
-            d_batch_input + batch_idx * INPUT_SIZE,   // Input vector for this batch
-            d_batch_hidden + batch_idx * HIDDEN_SIZE, // Output hidden layer
-            net->d_b1,                                // Bias vector
-            HIDDEN_SIZE,                              // M dimension (output neurons)
-            1,                                        // N dimension (batch size = 1)
-            INPUT_SIZE,                               // K dimension (input neurons)
-            INPUT_SIZE,                               // lda (leading dimension of A)
-            1,                                        // ldb (leading dimension of B)
-            1,                                        // ldc (leading dimension of C)
-            0);                                       // Batch idx (already offset in pointer)
-            
-        // Apply ReLU activation to the hidden layer
-        dim3 blockDim2(256);
-        dim3 gridDim2((HIDDEN_SIZE + 255) / 256);
-        
-        batchReLUKernel<<<gridDim2, blockDim2, 0, stream>>>(
-            d_batch_hidden + batch_idx * HIDDEN_SIZE, HIDDEN_SIZE, 1);
-            
-        // Second layer: W2 * hidden + b2
-        dim3 gridDim3((OUTPUT_SIZE + WMMA_M - 1) / WMMA_M, 1);
-        
-        wmmaMatrixMulKernel<<<gridDim3, blockDim1, 0, stream>>>(
-            net->d_W2,                                // Weight matrix
-            d_batch_hidden + batch_idx * HIDDEN_SIZE, // Hidden layer
-            d_batch_output + batch_idx * OUTPUT_SIZE, // Output layer
-            net->d_b2,                                // Bias vector
-            OUTPUT_SIZE,                              // M dimension (output neurons)
-            1,                                        // N dimension (batch size = 1)
-            HIDDEN_SIZE,                              // K dimension (hidden neurons)
-            HIDDEN_SIZE,                              // lda
-            1,                                        // ldb
-            1,                                        // ldc
-            0);                                       // Batch idx (already offset in pointer)
-    }
+    // First layer: Process the entire batch at once using standard implementation
+    dim3 blockDim1(32, 8);  // Use 256 threads per block
+    dim3 gridDim1((HIDDEN_SIZE + blockDim1.y - 1) / blockDim1.y, (batchSize + blockDim1.z - 1) / blockDim1.z);
     
-    // Apply softmax to the batch outputs
+    // Use the optimized standard implementation which has better accuracy
+    batchFCReluKernel<<<gridDim1, blockDim1, 0, stream>>>(
+        net->d_W1, d_batch_input, d_batch_hidden, 
+        net->d_b1, HIDDEN_SIZE, INPUT_SIZE, batchSize);
+    
+    // Second layer: Use standard implementation for better accuracy
+    dim3 blockDim2(32, 8);
+    dim3 gridDim2((OUTPUT_SIZE + blockDim2.y - 1) / blockDim2.y, (batchSize + blockDim2.z - 1) / blockDim2.z);
+    
+    batchFCKernel<<<gridDim2, blockDim2, 0, stream>>>(
+        net->d_W2, d_batch_hidden, d_batch_output,
+        net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, batchSize);
+    
+    // Apply softmax to all batch outputs
     batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(
         d_batch_output, OUTPUT_SIZE, batchSize);
 }
+
 
 // Forward propagation for the batch using traditional GPU kernels
 void forwardBatch(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
