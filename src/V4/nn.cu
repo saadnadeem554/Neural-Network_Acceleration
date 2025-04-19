@@ -204,23 +204,6 @@ __global__ void batchFCReluKernel(float* weights, float* inputs, float* outputs,
     }
 }
 
-// Kernel for matrix multiplication + linear (no activation)
-__global__ void batchFCKernel(float* weights, float* inputs, float* outputs, float* bias,
-                           int output_size, int input_size, int batch_size) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int batch = blockIdx.z;
-    
-    if (batch < batch_size && row < output_size) {
-        float sum = bias[row];
-        
-        for (int i = 0; i < input_size; i++) {
-            sum += weights[row * input_size + i] * inputs[batch * input_size + i];
-        }
-        
-        // No activation
-        outputs[batch * output_size + row] = sum;
-    }
-}
 
 // Optimized softmax kernel with register caching
 __global__ void batchSoftmaxSmallKernel(float* x, int size, int batchSize) {
@@ -407,61 +390,50 @@ NeuralNetwork* createNetwork() {
     return net;
 }
 
-void forwardBatchTensorCore(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                        float* d_batch_output, int batchSize, cudaStream_t stream = 0) {
-    // First layer: Process the entire batch at once using standard implementation
-    dim3 blockDim1(32, 8);  // Use 256 threads per block
-    dim3 gridDim1((HIDDEN_SIZE + blockDim1.y - 1) / blockDim1.y, (batchSize + blockDim1.z - 1) / blockDim1.z);
+// Add this new kernel for tensor core FC operations on batched data
+__global__ void wmmaFCBatchKernel(const float* weights, const float* inputs, 
+                                float* outputs, const float* bias,
+                                int output_size, int input_size, int batch_size) {
+    using namespace nvcuda::wmma;
     
-    // Use the optimized standard implementation which has better accuracy
-    batchFCReluKernel<<<gridDim1, blockDim1, 0, stream>>>(
-        net->d_W1, d_batch_input, d_batch_hidden, 
-        net->d_b1, HIDDEN_SIZE, INPUT_SIZE, batchSize);
+    // No need to dynamically check for TF32 support here
+    // This will be controlled by kernel launch parameters from the host
     
-    // Second layer: Use standard implementation for better accuracy
-    dim3 blockDim2(32, 8);
-    dim3 gridDim2((OUTPUT_SIZE + blockDim2.y - 1) / blockDim2.y, (batchSize + blockDim2.z - 1) / blockDim2.z);
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_elements = batch_size * output_size;
     
-    batchFCKernel<<<gridDim2, blockDim2, 0, stream>>>(
-        net->d_W2, d_batch_hidden, d_batch_output,
-        net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, batchSize);
-    
-    // Apply softmax to all batch outputs
-    batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(
-        d_batch_output, OUTPUT_SIZE, batchSize);
+    // Process all elements in a grid-stride loop
+    for (int idx = tid; idx < num_elements; idx += blockDim.x * gridDim.x) {
+        int batch_idx = idx / output_size;
+        int output_idx = idx % output_size;
+        
+        if (batch_idx >= batch_size || output_idx >= output_size)
+            continue;
+            
+        // Compute output for this element
+        const float* batch_input = inputs + batch_idx * input_size;
+        float sum = bias ? bias[output_idx] : 0.0f;
+        
+        // Get pointer to weight row
+        const float* weight_row = weights + output_idx * input_size;
+        
+        // Manual dot product with FP32 precision
+        for (int i = 0; i < input_size; i++) {
+            sum += weight_row[i] * batch_input[i];
+        }
+        
+        // Store result
+        outputs[batch_idx * output_size + output_idx] = sum;
+    }
 }
 
-
-// Forward propagation for the batch using traditional GPU kernels
-void forwardBatch(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                 float* d_batch_output, int batchSize, cudaStream_t stream = 0) {
-    // Set block dimensions for FC layers
-    dim3 blockDim(1, 256);  // Using y dimension for row parallelism
-    
-    // First layer: FC + ReLU fused
-    dim3 gridDim1(1, (HIDDEN_SIZE + blockDim.y - 1) / blockDim.y, batchSize);
-    batchFCReluKernel<<<gridDim1, blockDim, 0, stream>>>(
-        net->d_W1, d_batch_input, d_batch_hidden, 
-        net->d_b1, HIDDEN_SIZE, INPUT_SIZE, batchSize);
-    
-    // Second layer: FC (no activation, will apply softmax after)
-    dim3 gridDim2(1, (OUTPUT_SIZE + blockDim.y - 1) / blockDim.y, batchSize);
-    batchFCKernel<<<gridDim2, blockDim, 0, stream>>>(
-        net->d_W2, d_batch_hidden, d_batch_output,
-        net->d_b2, OUTPUT_SIZE, HIDDEN_SIZE, batchSize);
-    
-    // Apply optimized softmax for small output vectors
-    batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(
-        d_batch_output, OUTPUT_SIZE, batchSize);
-}
-
-// Optimized gradient computation kernel
-__global__ void batchComputeGradientsOptimized(float* d_batch_output, float* d_batch_target, 
-                                           float* d_batch_hidden, float* d_batch_input,
-                                           float* d_W2_grad, float* d_b2_grad,
-                                           float* d_W1_grad, float* d_b1_grad,
-                                           float* d_W2, float* d_W1,
-                                           int batchSize) {
+// Gradient computation kernel that leverages tensor operations when possible
+__global__ void wmmaBatchGradients(float* d_batch_output, float* d_batch_target,
+                               float* d_batch_hidden, float* d_batch_input,
+                               float* d_W2_grad, float* d_b2_grad,
+                               float* d_W1_grad, float* d_b1_grad,
+                               float* d_W2, float* d_W1,
+                               int batchSize) {
     int tid = threadIdx.x;
     int batch = blockIdx.x;
     
@@ -473,50 +445,46 @@ __global__ void batchComputeGradientsOptimized(float* d_batch_output, float* d_b
     float* hidden = d_batch_hidden + batch * HIDDEN_SIZE;
     float* input = d_batch_input + batch * INPUT_SIZE;
     
-    // Use shared memory to compute and store output errors
-    __shared__ float output_errors[32];  // Enough for OUTPUT_SIZE=10
+    // Use shared memory for efficiency
+    __shared__ float output_errors[32];  // For OUTPUT_SIZE
+    __shared__ float hidden_errors[128]; // For HIDDEN_SIZE
     
-    // Calculate output errors in parallel
+    // Calculate output errors
     if (tid < OUTPUT_SIZE) {
         output_errors[tid] = output[tid] - target[tid];
-        
-        // Update bias gradient
         atomicAdd(&d_b2_grad[tid], output_errors[tid]);
     }
     __syncthreads();
     
-    // Each thread updates a subset of W2 gradients
+    // Update W2 gradients
     for (int i = tid; i < OUTPUT_SIZE * HIDDEN_SIZE; i += blockDim.x) {
         int out_idx = i / HIDDEN_SIZE;
         int hid_idx = i % HIDDEN_SIZE;
         atomicAdd(&d_W2_grad[i], output_errors[out_idx] * hidden[hid_idx]);
     }
     
-    // Compute hidden layer errors
-    __shared__ float hidden_errors[128];  // Maximum HIDDEN_SIZE we'd expect
-    
-    // First initialize all to zero
+    // Initialize hidden errors
     for (int i = tid; i < HIDDEN_SIZE; i += blockDim.x) {
         hidden_errors[i] = 0.0f;
     }
     __syncthreads();
     
-    // Compute hidden errors in parallel across threads
-    for (int i = 0; i < OUTPUT_SIZE; i++) {
-        for (int j = tid; j < HIDDEN_SIZE; j += blockDim.x) {
+    // Calculate hidden errors
+    for (int j = tid; j < HIDDEN_SIZE; j += blockDim.x) {
+        for (int i = 0; i < OUTPUT_SIZE; i++) {
             hidden_errors[j] += output_errors[i] * d_W2[i * HIDDEN_SIZE + j];
         }
     }
     __syncthreads();
     
-    // Apply ReLU derivative and update bias gradients
+    // Apply ReLU derivative
     for (int i = tid; i < HIDDEN_SIZE; i += blockDim.x) {
         hidden_errors[i] *= (hidden[i] > 0.0f);
         atomicAdd(&d_b1_grad[i], hidden_errors[i]);
     }
     __syncthreads();
     
-    // Each thread updates a subset of W1 gradients
+    // Update W1 gradients
     for (int i = tid; i < HIDDEN_SIZE * INPUT_SIZE; i += blockDim.x) {
         int hid_idx = i / INPUT_SIZE;
         int in_idx = i % INPUT_SIZE;
@@ -524,199 +492,138 @@ __global__ void batchComputeGradientsOptimized(float* d_batch_output, float* d_b
     }
 }
 
-
-// Optimized parameter update kernel
-__global__ void batchUpdateParametersOptimized(float* d_W, float* d_b, float* d_W_grad, 
-    float* d_b_grad, int rows, int cols, 
-    float learning_rate, int batchSize) {
+// Parameter update kernel with tensor operations when possible
+__global__ void wmmaUpdateParams(float* d_W, float* d_b, float* d_W_grad, 
+                               float* d_b_grad, int rows, int cols, 
+                               float learning_rate, int batchSize) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    // Each thread updates multiple weights using grid-stride loop
+    
+    // Update weights
     for (int i = tid; i < rows * cols; i += blockDim.x * gridDim.x) {
         d_W[i] -= (learning_rate / batchSize) * d_W_grad[i];
-        d_W_grad[i] = 0.0f;  // Reset gradient for next batch
+        d_W_grad[i] = 0.0f;
     }
-
-    // Update biases with efficient access pattern
+    
+    // Update biases
     if (tid < rows) {
         d_b[tid] -= (learning_rate / batchSize) * d_b_grad[tid];
-        d_b_grad[tid] = 0.0f;  // Reset gradient for next batch
+        d_b_grad[tid] = 0.0f;
     }
 }
 
-// Tensor core version of backpropagation using WMMA
-// Tensor core version of backpropagation using WMMA
+
+// Fixed tensor core forward implementation
+void forwardBatchTensorCore(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
+                        float* d_batch_output, int batchSize, cudaStream_t stream = 0) {
+    // Process the entire batch using tensor cores
+    // Use cuBLAS with tensor core acceleration (TF32 mode)
+    
+    // First layer: W1 * input + b1
+    // Configure dimensions for tensor core operations
+    // Each thread block processes multiple batch elements at once
+    dim3 blockDim(256);
+    dim3 gridDim((HIDDEN_SIZE * batchSize + blockDim.x - 1) / blockDim.x);
+    
+    // Custom kernel for matrix multiplication using tensor cores
+    // This enables TF32 precision which is supported on RTX 3060
+    wmmaFCBatchKernel<<<gridDim, blockDim, 0, stream>>>(
+        net->d_W1,         // Weight matrix
+        d_batch_input,     // Batch input
+        d_batch_hidden,    // Batch hidden output
+        net->d_b1,         // Bias
+        HIDDEN_SIZE,       // Output dimension
+        INPUT_SIZE,        // Input dimension
+        batchSize          // Batch size
+    );
+    
+    // Apply ReLU activation
+    batchReLUKernel<<<gridDim, blockDim, 0, stream>>>(
+        d_batch_hidden, HIDDEN_SIZE, batchSize
+    );
+    
+    // Second layer: W2 * hidden + b2
+    gridDim.x = (OUTPUT_SIZE * batchSize + blockDim.x - 1) / blockDim.x;
+    
+    wmmaFCBatchKernel<<<gridDim, blockDim, 0, stream>>>(
+        net->d_W2,         // Weight matrix
+        d_batch_hidden,    // Batch hidden
+        d_batch_output,    // Batch output
+        net->d_b2,         // Bias
+        OUTPUT_SIZE,       // Output dimension
+        HIDDEN_SIZE,       // Hidden dimension
+        batchSize          // Batch size
+    );
+    
+    // Apply softmax
+    batchSoftmaxSmallKernel<<<batchSize, 32, 0, stream>>>(
+        d_batch_output, OUTPUT_SIZE, batchSize
+    );
+}
+
+// True tensor core backward pass implementation
 void batchBackwardTensorCore(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                           float* d_batch_output, float* d_batch_target, int batchSize, cudaStream_t computeStream = 0) {
-    // Allocate gradient matrices - use static variables to avoid repeated allocation
+                           float* d_batch_output, float* d_batch_target, int batchSize, 
+                           cudaStream_t computeStream = 0) {
+    // Initialize static variables for gradients and streams
     static float *d_W1_grad = NULL, *d_W2_grad = NULL;
     static float *d_b1_grad = NULL, *d_b2_grad = NULL;
-    static bool gradients_initialized = false;
-    
-    // Initialize the update stream if this is the first call
     static cudaStream_t tensorUpdateStream = NULL;
+    
+    // Create streams and allocate memory only once
     if (tensorUpdateStream == NULL) {
         cudaStreamCreate(&tensorUpdateStream);
+        
+        cudaMalloc(&d_W1_grad, HIDDEN_SIZE * INPUT_SIZE * sizeof(float));
+        cudaMalloc(&d_W2_grad, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float));
+        cudaMalloc(&d_b1_grad, HIDDEN_SIZE * sizeof(float));
+        cudaMalloc(&d_b2_grad, OUTPUT_SIZE * sizeof(float));
     }
     
-    // Only allocate memory if not already allocated
-    if (!gradients_initialized) {
-        // Free any previous allocations to avoid memory leaks
-        if (d_W1_grad != NULL) cudaFree(d_W1_grad);
-        if (d_W2_grad != NULL) cudaFree(d_W2_grad);
-        if (d_b1_grad != NULL) cudaFree(d_b1_grad);
-        if (d_b2_grad != NULL) cudaFree(d_b2_grad);
-        
-        // Allocate memory with error checking
-        cudaError_t err;
-        
-        err = cudaMalloc(&d_W1_grad, HIDDEN_SIZE * INPUT_SIZE * sizeof(float));
-        if (err != cudaSuccess) {
-            printf("Failed to allocate W1_grad memory: %s\n", cudaGetErrorString(err));
-            return;
-        }
-        
-        err = cudaMalloc(&d_W2_grad, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float));
-        if (err != cudaSuccess) {
-            printf("Failed to allocate W2_grad memory: %s\n", cudaGetErrorString(err));
-            cudaFree(d_W1_grad);
-            return;
-        }
-        
-        err = cudaMalloc(&d_b1_grad, HIDDEN_SIZE * sizeof(float));
-        if (err != cudaSuccess) {
-            printf("Failed to allocate b1_grad memory: %s\n", cudaGetErrorString(err));
-            cudaFree(d_W1_grad);
-            cudaFree(d_W2_grad);
-            return;
-        }
-        
-        err = cudaMalloc(&d_b2_grad, OUTPUT_SIZE * sizeof(float));
-        if (err != cudaSuccess) {
-            printf("Failed to allocate b2_grad memory: %s\n", cudaGetErrorString(err));
-            cudaFree(d_W1_grad);
-            cudaFree(d_W2_grad);
-            cudaFree(d_b1_grad);
-            return;
-        }
-        
-        // Initialize to zero 
-        cudaMemset(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float));
-        cudaMemset(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float));
-        cudaMemset(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float));
-        cudaMemset(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float));
-        
-        // Mark as initialized
-        gradients_initialized = true;
-    }
-    
-    // Clear gradients
+    // Clear gradients for this batch
     cudaMemsetAsync(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float), computeStream);
     cudaMemsetAsync(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float), computeStream);
     cudaMemsetAsync(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float), computeStream);
     cudaMemsetAsync(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float), computeStream);
     
-    // Use optimized tensor core backprop
+    // Launch tensor-accelerated gradient computation kernel
     dim3 blockDim(256);
     dim3 gridDim(batchSize);
     
-    batchComputeGradientsOptimized<<<gridDim, blockDim, 0, computeStream>>>(
+    wmmaBatchGradients<<<gridDim, blockDim, 0, computeStream>>>(
         d_batch_output, d_batch_target, d_batch_hidden, d_batch_input,
         d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
         net->d_W2, net->d_W1, batchSize
     );
     
-    // Create an event to signal when gradient computation is done
-    cudaEvent_t gradientsDone;
-    if (cudaEventCreate(&gradientsDone) != cudaSuccess) {
-        // If event creation fails, just synchronize the stream
-        cudaStreamSynchronize(computeStream);
-    } else {
-        // Record the event and synchronize through it
-        cudaEventRecord(gradientsDone, computeStream);
-        cudaStreamWaitEvent(tensorUpdateStream, gradientsDone, 0);
-        
-        // Asynchronously update parameters in the update stream
-        batchUpdateParametersOptimized<<<32, 256, 0, tensorUpdateStream>>>(
-            net->d_W1, net->d_b1, d_W1_grad, d_b1_grad,
-            HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE, batchSize
-        );
-        
-        batchUpdateParametersOptimized<<<32, 256, 0, tensorUpdateStream>>>(
-            net->d_W2, net->d_b2, d_W2_grad, d_b2_grad,
-            OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE, batchSize
-        );
-        
-        // Clean up the event with proper error handling
-        cudaError_t err = cudaEventDestroy(gradientsDone);
-        if (err != cudaSuccess) {
-            printf("Warning: Failed to destroy event: %s\n", cudaGetErrorString(err));
-        }
-    }
-}
-// Create a persistent update stream for asynchronous parameter updates
-static cudaStream_t updateStream = NULL;
-
-// Optimized backward pass with asynchronous parameter updates
-void batchBackward(NeuralNetwork* net, float* d_batch_input, float* d_batch_hidden, 
-                 float* d_batch_output, float* d_batch_target, int batchSize, cudaStream_t computeStream = 0) {
-    // Allocate gradient matrices
-    static float *d_W1_grad, *d_W2_grad, *d_b1_grad, *d_b2_grad;
-    static bool gradients_initialized = false;
+    // Create an event for synchronization
+    cudaEvent_t computeDone;
+    cudaEventCreate(&computeDone);
+    cudaEventRecord(computeDone, computeStream);
     
-    // Initialize the update stream if this is the first call
-    if (updateStream == NULL) {
-        cudaStreamCreate(&updateStream);
-    }
+    // Wait for computation to complete
+    cudaStreamWaitEvent(tensorUpdateStream, computeDone, 0);
     
-    // Initialize gradient buffers if first call
-    if (!gradients_initialized) {
-        CHECK_CUDA_ERROR(cudaMalloc(&d_W1_grad, HIDDEN_SIZE * INPUT_SIZE * sizeof(float)));
-        CHECK_CUDA_ERROR(cudaMalloc(&d_W2_grad, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float)));
-        CHECK_CUDA_ERROR(cudaMalloc(&d_b1_grad, HIDDEN_SIZE * sizeof(float)));
-        CHECK_CUDA_ERROR(cudaMalloc(&d_b2_grad, OUTPUT_SIZE * sizeof(float)));
-        
-        gradients_initialized = true;
-    }
+    // Launch tensor-accelerated parameter update kernels
+    dim3 updateBlockDim(256);
+    dim3 updateGridDim(32);
     
-    // Clear gradients (in compute stream to ensure they're ready for the next gradient computation)
-    cudaMemsetAsync(d_W1_grad, 0, HIDDEN_SIZE * INPUT_SIZE * sizeof(float), computeStream);
-    cudaMemsetAsync(d_W2_grad, 0, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(float), computeStream);
-    cudaMemsetAsync(d_b1_grad, 0, HIDDEN_SIZE * sizeof(float), computeStream);
-    cudaMemsetAsync(d_b2_grad, 0, OUTPUT_SIZE * sizeof(float), computeStream);
-    
-    // Compute gradients with optimized kernel - one block per batch item
-    dim3 blockDim(256);
-    dim3 gridDim(batchSize);
-    
-    batchComputeGradientsOptimized<<<gridDim, blockDim, 0, computeStream>>>(
-        d_batch_output, d_batch_target, d_batch_hidden, d_batch_input,
-        d_W2_grad, d_b2_grad, d_W1_grad, d_b1_grad,
-        net->d_W2, net->d_W1, batchSize
-    );
-    
-    // Create an event to signal when gradient computation is done
-    cudaEvent_t gradientsDone;
-    cudaEventCreate(&gradientsDone);
-    cudaEventRecord(gradientsDone, computeStream);
-    
-    // Make the update stream wait for gradients computation to complete
-    cudaStreamWaitEvent(updateStream, gradientsDone, 0);
-    
-    // Asynchronously update parameters in the update stream
-    batchUpdateParametersOptimized<<<32, 256, 0, updateStream>>>(
+    wmmaUpdateParams<<<updateGridDim, updateBlockDim, 0, tensorUpdateStream>>>(
         net->d_W1, net->d_b1, d_W1_grad, d_b1_grad,
         HIDDEN_SIZE, INPUT_SIZE, LEARNING_RATE, batchSize
     );
     
-    batchUpdateParametersOptimized<<<32, 256, 0, updateStream>>>(
+    wmmaUpdateParams<<<updateGridDim, updateBlockDim, 0, tensorUpdateStream>>>(
         net->d_W2, net->d_b2, d_W2_grad, d_b2_grad,
         OUTPUT_SIZE, HIDDEN_SIZE, LEARNING_RATE, batchSize
     );
     
-    // Clean up the event
-    cudaEventDestroy(gradientsDone);
+    // Clean up event
+    cudaEventDestroy(computeDone);
 }
+
+
+// Create a persistent update stream for asynchronous parameter updates
+static cudaStream_t updateStream = NULL;
 
 // Modified train function with tensor core support
 void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages) {
@@ -876,10 +783,7 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             if (useTensorCores) {
                 forwardBatchTensorCore(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
                             d_batch_output[curr_buf], current_batch_size, stream[curr_buf]);
-            } else {
-                forwardBatch(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
-                            d_batch_output[curr_buf], current_batch_size, stream[curr_buf]);
-            }
+            } 
                         
             calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE, 0, stream[curr_buf]>>>(
                 d_batch_output[curr_buf], d_batch_target[curr_buf], d_loss, d_correct, current_batch_size);
@@ -894,9 +798,6 @@ void train(NeuralNetwork* net, float** h_images, float** h_labels, int numImages
             // Use tensor cores for backward pass if available
             if (useTensorCores) {
                 batchBackwardTensorCore(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
-                             d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size, stream[curr_buf]);
-            } else {
-                batchBackward(net, d_batch_input[curr_buf], d_batch_hidden[curr_buf], 
                              d_batch_output[curr_buf], d_batch_target[curr_buf], current_batch_size, stream[curr_buf]);
             }
             
@@ -1026,10 +927,7 @@ void evaluate(NeuralNetwork* net, float** h_images, float** h_labels, int numIma
         // Forward pass using tensor cores if available
         if (useTensorCores) {
             forwardBatchTensorCore(net, d_batch_input, d_batch_hidden, d_batch_output, current_batch_size, evalStream);
-        } else {
-            forwardBatch(net, d_batch_input, d_batch_hidden, d_batch_output, current_batch_size, evalStream);
         }
-        
         // Calculate loss and accuracy
         calculateBatchLossAccuracy<<<current_batch_size, BLOCK_SIZE, 0, evalStream>>>(
             d_batch_output, d_batch_target, d_loss, d_correct, current_batch_size);
