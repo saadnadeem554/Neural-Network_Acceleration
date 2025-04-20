@@ -1,150 +1,183 @@
-# Neural Network Acceleration on GPUs
+# ⚡ Neural Network Acceleration on GPUs
 
-This project focuses on accelerating a neural network for MNIST digit classification using CUDA on GPUs. We implement several versions with increasing optimization to demonstrate performance improvements.
+This project focuses on **accelerating a neural network for MNIST digit classification using CUDA**. Starting from a baseline sequential implementation, we progressively optimize the architecture using GPU computing techniques — from naive parallelization to Tensor Core acceleration with cuBLAS and OpenACC.
 
-## Project Overview
+---
 
-We start with a baseline CPU implementation of a simple neural network for classifying handwritten digits (MNIST dataset) and progressively optimize it for GPU execution using CUDA. The project demonstrates various optimization techniques including naive parallelization, memory optimizations, and utilization of tensor cores.
+## 🧠 Project Overview
 
-## Project Structure
+The MNIST dataset (handwritten digits 0–9) is used as a benchmark for evaluating various neural network implementations. The goal is to **compare multiple versions** of a feedforward neural network to assess improvements in:
 
-```
+- Execution time (training + evaluation)
+- Model accuracy
+- GPU utilization and profiling metrics
+
+We implement 6 versions:
+- **V1**: Sequential CPU
+- **V2**: Naive CUDA
+- **V3**: Optimized CUDA (with batching, kernel fusion)
+- **V4**: Tensor Core using WMMA
+- **V5**: OpenACC-based acceleration
+- **V6**: cuBLAS + Tensor Core (TF32) acceleration
+
+---
+
+## 📁 Project Structure
+
+```bash
 Neural-Network_Acceleration/
 ├── src/
-│   ├── V1/        # Sequential Implementation
-│   ├── V2/        # TO BE IMPLEMENTED
-│   ├── V3/        # TO BE IMPLEMENTED
-│   ├── V4/        # TO BE IMPLEMENTED
-│   
-├── report/        # Project report
-├── slides/        # Presentation slides
-└── data/      # MNIST dataset files
-└── README.md      # This file
+│   ├── V1/            # Sequential C implementation
+│   ├── V2/            # Naive CUDA version
+│   ├── V3/            # Optimized CUDA with batching and kernel fusion
+│   ├── V4/            # Tensor Core using WMMA (FP16)
+│   ├── V5/            # OpenACC accelerated version
+│   ├── V6/            # cuBLAS + TF32 Tensor Core acceleration
+│
+├── data/              # Raw MNIST dataset (.ubyte files)
+├── report/            # Detailed report (PDF)
+├── slides/            # Final presentation slides (PPTX)
+└── README.md          # This file
 ```
 
-## Dataset
+## 📦 Dataset
 
-The MNIST dataset consists of:
-- 60,000 training images
-- 10,000 test images
-- Each image is 28x28 grayscale (784 pixels)
-- 10 classes (digits 0-9)
+We use the official [MNIST dataset](http://yann.lecun.com/exdb/mnist/) containing:
 
-## Installation and Setup
+- **60,000** training images
+- **10,000** test images
+- **784 features per image** (28×28 grayscale)
+- **10 output classes** (digits 0–9)
 
-### Prerequisites
-- CUDA toolkit (v11.0 or higher recommended)
-- GCC compiler
-- Make
+Ensure the extracted `.ubyte` files are placed in the `data/` directory.
 
-## Compilation and Execution
+## ⚙️ Setup & Installation
 
-Navigate to the src directory to run all commands:
+### 🖥 Prerequisites
+
+- NVIDIA GPU with CUDA support (Compute Capability ≥ 7.0 recommended)
+- CUDA Toolkit (v11 or newer)
+- `make`, `gcc`, `nvcc`, and OpenACC (e.g., PGI or NVIDIA HPC compiler)
+- cuBLAS (included with CUDA)
+
+### 🔧 Compile & Run
+
+From the root directory:
 
 ```bash
 cd src
 ```
 
-### V1: Sequential Implementation
+To build and run a specific version:
+
 ```bash
-make v1
+make v1      # Sequential
+make v2      # Naive CUDA
+make v3      # Optimized CUDA
+make v4      # Tensor Core (WMMA)
+make v5      # OpenACC
+make v6      # cuBLAS + Tensor Core
 ```
 
-### V2: Naive GPU Implementation
+To clean all builds:
+
 ```bash
-make v2
+make clean
 ```
 
-### V3: Optimized GPU Implementation
-```bash
-make v3
-```
+## 🚀 Implementations & Highlights
 
-### V4: Tensor Core Implementation
-```bash
-make v4
-```
+### ✅ V1: Sequential (Baseline)
+- Pure C implementation with no parallelism
+- Single hidden layer (128 neurons, ReLU)
+- Softmax output, SGD
+- Execution Time: 23.48s
+- Test Accuracy: ~97%
 
-### Additional Make Commands
-- Clean all executables:
-  ```bash
-  make clean
-  ```
+### ✅ V2: Naive CUDA
+- GPU offload of forward & backward passes
+- Kernels: matrixMul, relu, softmax, updateParameters
+- Operates per-sample (no batching)
+- Execution Time: 37.63s (slower than CPU 😬)
+- Test Accuracy: 96.66%
+- Speedup: 0.62×
 
-## Implementation Details
-# MNIST Neural Network - V2 (Naive GPU Implementation)
+🔍 Bottlenecks:
+- Excessive memory transfers
+- atomicAdd overhead
+- Kernel launch latency
 
-## Overview
-This is a naive GPU implementation of a neural network for MNIST digit classification using CUDA. This version represents the first step in transitioning from CPU to GPU computation, serving as a baseline for further optimizations.
+### ✅ V3: Optimized CUDA
+- Introduces batching, double buffering, and stream-based updates
+- Fused kernels, shared memory, warp-level reductions
+- Execution Time: 0.675s
+- Test Accuracy: 91.25%
+- Speedup: 34.79×
 
+📊 Batch Size Tuning:
 
-### Architecture
-- Input Layer: 784 neurons (28x28 pixels)
-- Hidden Layer: 128 neurons with ReLU activation
-- Output Layer: 10 neurons with Softmax activation
-- Learning Rate: 0.01
-- Epochs: 3
-- Batch Size: 64
+| Batch Size | Time  | Accuracy |
+|------------|-------|----------|
+| 4          | 5.56s | 96.43%   |
+| 32         | 0.87s | 92.52%   |
+| 64         | 0.59s | 91.25%   |
+| 1024       | 0.35s | 75.62%   |
 
-### Key Components
-1. **Neural Network Structure**
-   - Device (GPU) weights and biases
-   - Host (CPU) copies of weights and biases
-   - Basic CUDA kernels for matrix operations
+### ✅ V4: Tensor Core via WMMA
+- Uses FP16 matrix multiplication via wmma::mma_sync
+- Manual kernel for __half inputs
+- Very fast but accuracy drops due to quantization
+- Result: Not suitable without mixed precision/loss scaling
 
-2. **CUDA Kernels**
-   - `reluKernel`: ReLU activation function
-   - `softmaxKernel`: Softmax activation function
-   - `matrixMulKernel`: Basic matrix multiplication
-   - `backwardOutputKernel`: Gradient computation
+### ✅ V5: OpenACC
+- Forward pass parallelized with #pragma acc
+- Softmax and memory managed via OpenACC
+- Backward pass remains on CPU
+- Easy to implement but limited acceleration
 
-3. **Memory Management**
-   - Basic GPU memory allocation and deallocation
-   - Simple host-to-device and device-to-host transfers
+### ✅ V6: cuBLAS + Tensor Cores (TF32)
+- Uses cublasGemmEx with CUBLAS_TF32_TENSOR_OP_MATH
+- Combined bias + ReLU kernels
+- Shared memory for loss/accuracy aggregation
+- Execution Time: 1.033s
+- Test Accuracy: 91.30%
+- Speedup: 22.73×
 
-## Performance Metrics
-- Training Time: ~36.47 seconds
-- Test Accuracy: 96.80%
-- Training Accuracy: 97.92% (after 3 epochs)
-- Data Loading Time: ~1.67 seconds
-- Total Execution Time: ~38.73 seconds
+## 📈 Version Comparison
 
-### Epoch-wise Performance
-- Epoch 1: 91.93% accuracy (12.239s)
-- Epoch 2: 96.99% accuracy (12.020s)
-- Epoch 3: 97.92% accuracy (12.004s)
+| Version | Time (s) | Speedup | Accuracy |
+|---------|----------|---------|----------|
+| V1      | 23.48    | 1.00×   | ~97%     |
+| V2      | 37.63    | 0.62×   | 96.66%   |
+| V3      | 0.675    | 34.79×  | 91.25%   |
+| V6      | 1.033    | 22.73×  | 91.30%   |
 
-## Known Limitations
-- Basic memory transfer pattern without optimization
-- No use of shared memory
-- Limited parallelization in backward pass
-- Single-stream execution
-- No batching optimization
-- Simple kernel configurations
+## 💡 Learnings & Takeaways
 
-## Implementation Details
-# MNIST Neural Network - V3 (Optimised GPU Implementation)
+- Batching is essential for GPU throughput
+- cuBLAS outperforms manual kernels for larger matrices
+- Tensor Cores require precision trade-offs (FP16/TF32)
+- OpenACC simplifies code but offers limited control
+- Memory layout, stream management, and kernel fusion = key performance levers
 
-## Overview
-This version builds upon V2 by introducing shared memory and other optimizations
+## 🧑‍💻 Team
 
-## Performance Metrics
-- Training Time: ~35.82 seconds
-- Test Accuracy: 96.97%
-- Training Accuracy: 97.77% (after 3 epochs)
-- Data Loading Time: ~1.67 seconds
-- Total Execution Time: ~37.83 seconds
+| Name           | GitHub           |
+|----------------|------------------|
+| Saad Nadeem   | @saadnadeem554  |
+| Mustafa Iqbal | @Mustafaiqbal2  |
+| Hassaan Anwar | @Hassaan-Anwar  |
 
-### Epoch-wise Performance
-- Epoch 1: 91.91% accuracy (11.970s)
-- Epoch 2: 96.86% accuracy (11.828s)
-- Epoch 3: 97.77% accuracy (11.821s)
+## 📎 References
 
-# Team Members
+- [MNIST Dataset](http://yann.lecun.com/exdb/mnist/)
+- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
+- [cuBLAS Documentation](https://docs.nvidia.com/cuda/cublas/index.html)
+- [OpenACC Standard](https://www.openacc.org/)
 
-## Saad Nadeem
-**Github**: [Saadnadeem554](https://github.com/saadnadeem554)
-## Hassaan Anwar
-**Github**: [Hassaan-Anwar](https://github.com/Hassaan-Anwar)
-## Mustafa Iqbal
-**Github**: [Mustafaiqbal2](https://github.com/mustafaiqbal2)
+## 📄 Report and Slides
+
+- [📘 Project Report (PDF)](./report/report.pdf)
+- [📊 Presentation Slides (PPTX)](./slides/presentation.pptx)
+
+## github repo link: https://github.com/Mustafaiqbal2/Neural-Network_Acceleration
