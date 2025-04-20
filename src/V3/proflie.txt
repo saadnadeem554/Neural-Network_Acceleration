@@ -1,49 +1,37 @@
 ----------------------------------------------------------------------------------------------------------
-Total Execution Time: 82.662s (100%)
+Total Execution Time: 2.359s (100%)
 ----------------------------------------------------------------------------------------------------------
 High-Level Timing
-    Data Loading: 2.088s (2.53%)
-
-    Training Time: 79.314s (95.96%)
-
-    Evaluation Time: 1.259s (1.52%)
+    Data Loading: 0.276s (11.70%)
+    Training Time: 2.042s (86.56%)
+    Evaluation Time: 0.042s (1.78%)
 ----------------------------------------------------------------------------------------------------------
 
 ----------------------------------------------------------------------------------------------------------
 GPU Kernel Execution (from nvprof)
-    computeGradients: 20.205s (70.19% of GPU time)
-
-    matrixMulKernel: 5.910s (20.53%)
-
-    updateParameters: 0.690s (2.40%)
-
-    [CUDA memset]: 0.644s (2.24%)
-
-    softmaxKernel: 0.508s (1.77%)
-
-    reluKernel: 0.226s (0.78%)
-
+    batchFCReluKernel: 660.18ms (68.42% of GPU time)
+    batchComputeGradientsOptimized: 178.94ms (18.54%)
+    batchFCKernel: 18.941ms (1.96%)
+    batchUpdateParametersOptimized: 17.927ms (1.86%)
+    batchSoftmaxSmallKernel: 6.336ms (0.66%)
+    [CUDA memcpy HtoD]: 60.984ms (6.32%)
+    [CUDA memset]: 11.544ms (1.20%)
 ----------------------------------------------------------------------------------------------------------
-Total Kernel Time (GPU activities): 28.183s (34.10% of total execution time)
+Total Kernel Time (GPU activities): 945.92ms (40.09% of total execution time)
 ----------------------------------------------------------------------------------------------------------
 
 Memory Transfer Time
-    Device to Host (DtoH): 0.440s
-
-    Host to Device (HtoD): 0.164s
-
-    Total Memory Transfer (GPU): 0.604s (0.73% of total)
-
+    Host to Device (HtoD): 60.984ms
+    Device to Host (DtoH): 8.864µs
+    Total Memory Transfer (GPU): 60.993ms (2.58% of total)
 ----------------------------------------------------------------------------------------------------------
 
 ----------------------------------------------------------------------------------------------------------
 Host-Side (API Overhead)
-    cudaMemcpy (API calls): 7.744s
-
-Other CUDA API overhead (malloc, launch, memset, etc.): ~15.1s
-Total Host-side (API) Time: ≈ 22.8s
-
-Combined Transfer Time (Perceived)
-    Memory Transfer (GPU + Host API): 8.348s (10.10%)
-
+    cudaEventSynchronize: 1.02956s
+    cudaLaunchKernel: 191.85ms
+    cudaMalloc: 90.624ms
+    cudaMemsetAsync: 81.457ms
+    cudaMemcpyAsync: 60.524ms
+Total Host-side (API) Time: ≈1.453s (61.59%)
 ----------------------------------------------------------------------------------------------------------
