@@ -1,0 +1,59 @@
+----------------------------------------------------------------------------------------------------------
+Total Execution Time: 2.542s (100%)
+----------------------------------------------------------------------------------------------------------
+High-Level Timing
+    Data Loading: 0.272s (10.70%)
+    Training Time: 2.176s (85.60%)
+    Evaluation Time: 0.095s (3.74%)
+----------------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------------
+GPU Kernel Execution (from nvprof)
+    volta_sgemm_32x32_sliced1x4_nn: 75.062ms (20.61% of GPU time)
+    [CUDA memcpy HtoD]: 62.474ms (17.15%)
+    axpy_kernel_val: 40.819ms (11.21%)
+    volta_sgemm_32x128_nt: 35.258ms (9.68%)
+    computeBiasGrads: 24.128ms (6.63%)
+    volta_sgemm_32x32_sliced1x4_nt: 23.999ms (6.59%)
+    volta_sgemm_128x32_tn: 20.364ms (5.59%)
+    [CUDA memset]: 17.969ms (4.93%)
+    calculateBatchLossAccuracy: 16.097ms (4.42%)
+    addBiasWithOptionalReLU: 14.211ms (3.90%)
+----------------------------------------------------------------------------------------------------------
+Total Kernel Time (GPU activities): 364.16ms (14.33% of total execution time)
+----------------------------------------------------------------------------------------------------------
+
+Memory Transfer Time
+    Host to Device (HtoD): 62.474ms
+    Device to Device (DtoD): 5.967ms
+    Device to Host (DtoH): 11.359µs
+    Total Memory Transfer (GPU): 68.452ms (2.69% of total)
+----------------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------------
+Host-Side (API Overhead)
+    cudaLaunchKernel: 410.40ms
+    cudaMalloc: 148.69ms
+    cudaMemcpyAsync: 72.698ms
+    cudaMemsetAsync: 64.354ms
+    cudaEventSynchronize: 60.498ms
+Total Host-side (API) Time: ≈756.63ms (29.77%)
+----------------------------------------------------------------------------------------------------------
+
+Actual Time (without nvprof pure execution)
+
+MNIST Neural Network
+Time to load data: 0.278s
+Epoch 1 - Loss: 0.8712 - Train Accuracy: 79.01% - Time: 0.254s
+  Transfer: 101.47 ms, Forward: 70.24 ms, Backward: 101.98 ms
+Epoch 2 - Loss: 0.4187 - Train Accuracy: 88.69% - Time: 0.195s
+  Transfer: 77.69 ms, Forward: 41.42 ms, Backward: 77.73 ms
+Epoch 3 - Loss: 0.3518 - Train Accuracy: 90.19% - Time: 0.166s
+  Transfer: 64.20 ms, Forward: 30.20 ms, Backward: 64.23 ms
+Time to train: 0.735s
+Evaluating...
+Test Accuracy: 91.30%
+Time to evaluate: 0.019s
+Total execution time: 1.033s
+
+----------------------------------------------------------------------------------------------------------

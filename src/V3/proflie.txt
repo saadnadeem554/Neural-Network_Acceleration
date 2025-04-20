@@ -35,3 +35,21 @@ Host-Side (API Overhead)
     cudaMemcpyAsync: 60.524ms
 Total Host-side (API) Time: ≈1.453s (61.59%)
 ----------------------------------------------------------------------------------------------------------
+
+Actual Time (without nvprof pure execution)
+
+MNIST Neural Network
+
+Time to load data: 0.274s
+Epoch 1 - Loss: 0.8756 - Train Accuracy: 78.46% - Time: 0.483s
+  Transfer: 94.26 ms, Forward: 306.64 ms, Backward: 94.28 ms
+Epoch 2 - Loss: 0.4217 - Train Accuracy: 88.66% - Time: 0.335s
+  Transfer: 63.48 ms, Forward: 196.99 ms, Backward: 63.51 ms
+Epoch 3 - Loss: 0.3573 - Train Accuracy: 90.06% - Time: 0.335s
+  Transfer: 63.29 ms, Forward: 197.30 ms, Backward: 63.32 ms
+Time to train: 1.252s
+Test Accuracy: 91.25%
+Time to evaluate: 0.039s
+Total execution time: 1.565s
+
+----------------------------------------------------------------------------------------------------------

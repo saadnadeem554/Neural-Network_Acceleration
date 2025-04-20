@@ -47,3 +47,17 @@ Combined Transfer Time (Perceived)
     Memory Transfer (GPU + Host API): 8.348s (10.10%)
 
 ----------------------------------------------------------------------------------------------------------
+
+Actual Time (without nvprof pure execution)
+MNIST Neural Network
+
+Time to load data: 1.597s
+Epoch 1 - Loss: 0.2667 - Train Accuracy: 91.93% - Time: 11.868s
+Epoch 2 - Loss: 0.1044 - Train Accuracy: 96.94% - Time: 11.756s
+Epoch 3 - Loss: 0.0719 - Train Accuracy: 97.87% - Time: 11.793s
+Time to train: 35.519s
+Test Accuracy: 96.66%
+Time to evaluate: 0.515s
+Total execution time: 37.632s
+
+----------------------------------------------------------------------------------------------------------
